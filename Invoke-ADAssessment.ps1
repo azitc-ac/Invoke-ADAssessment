@@ -715,6 +715,86 @@ try {
     }
 } catch { Write-Log "LAPS check failed: $_" 'WARN' }
 
+# --- 17. AdminSDHolder ACL - Dangerous ACEs -------------------------------------
+Write-Log "Checking AdminSDHolder ACL for dangerous ACEs ..." 'INFO'
+try {
+    $tier0Principals = @('Domain Admins','Enterprise Admins','Administrators','SYSTEM')
+    $sdHolderDN = "CN=AdminSDHolder,CN=System," + (Get-ADDomain).DistinguishedName
+    $sdAcl = Get-Acl -Path ("AD:\" + $sdHolderDN) -ErrorAction Stop
+
+    $sdDangerous = foreach ($ace in $sdAcl.Access) {
+        if ($ace.AccessControlType -eq 'Allow' -and "$($ace.ActiveDirectoryRights)" -match 'GenericAll|WriteDacl|WriteOwner') {
+            $id = $ace.IdentityReference.Value
+            $short = ($id -split '\\')[-1]
+            if ($tier0Principals -notcontains $short) {
+                [pscustomobject]@{ Principal = $id; Rights = "$($ace.ActiveDirectoryRights)"; Inherited = $ace.IsInherited }
+            }
+        }
+    }
+    if (@($sdDangerous).Count -gt 0) {
+        Add-FindingWithObjects 'Delegation' 'Critical' (Bi "Non-standard principals with dangerous rights on AdminSDHolder" "Nicht-Standard-Prinzipale mit gefaehrlichen Rechten auf AdminSDHolder") $sdDangerous `
+            (Bi "GenericAll/WriteDacl/WriteOwner on AdminSDHolder propagates to every SDProp-protected (Tier-0) account - a backdoor into Domain Admins." "GenericAll/WriteDacl/WriteOwner auf AdminSDHolder propagiert per SDProp auf alle geschuetzten (Tier-0) Konten - eine Hintertuer in Richtung Domain Admins.") `
+            (Bi "Remove unexpected ACEs immediately; investigate how/when they were added." "Unerwartete ACEs sofort entfernen; pruefen wie/wann sie hinzugefuegt wurden.") `
+            (Bi "Only Domain Admins/Enterprise Admins/Administrators/SYSTEM are expected to hold these rights by default." "Standardmaessig sollten nur Domain Admins/Enterprise Admins/Administrators/SYSTEM diese Rechte besitzen.")
+    } else {
+        Add-Finding 'Delegation' 'Info' (Bi "No non-standard dangerous ACEs found on AdminSDHolder" "Keine Nicht-Standard-ACEs mit gefaehrlichen Rechten auf AdminSDHolder gefunden") `
+            (Bi "Only the expected Tier-0 principals hold GenericAll/WriteDacl/WriteOwner." "Nur die erwarteten Tier-0-Prinzipale besitzen GenericAll/WriteDacl/WriteOwner.") `
+            (Bi "No action needed; re-check after changes." "Keine Aktion noetig; bei Aenderungen erneut pruefen.")
+    }
+} catch { Write-Log "AdminSDHolder ACL check failed: $_" 'WARN' }
+
+# --- 18. Domain Root / OU ACL Hardening (Dangerous ACEs) ------------------------
+Write-Log "Checking domain root and OU ACLs for dangerous delegated rights ..." 'INFO'
+try {
+    $tier0Principals = @('Domain Admins','Enterprise Admins','Administrators','SYSTEM')
+    $domainDN = (Get-ADDomain).DistinguishedName
+
+    # Returns dangerous (GenericAll/WriteDacl/WriteOwner) Allow ACEs held by non-Tier-0 principals.
+    # $OnlyExplicit restricts to non-inherited ACEs (used for OUs, to avoid re-reporting what's already
+    # flagged as inherited from the domain root).
+    function Get-DangerousAces {
+        param([string]$Dn, [bool]$OnlyExplicit)
+        $acl = Get-Acl -Path ("AD:\" + $Dn) -ErrorAction Stop
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne 'Allow') { continue }
+            if ($OnlyExplicit -and $ace.IsInherited) { continue }
+            if ("$($ace.ActiveDirectoryRights)" -notmatch 'GenericAll|WriteDacl|WriteOwner') { continue }
+            $id = $ace.IdentityReference.Value
+            $short = ($id -split '\\')[-1]
+            if ($tier0Principals -contains $short) { continue }
+            [pscustomobject]@{ Object = $Dn; Principal = $id; Rights = "$($ace.ActiveDirectoryRights)"; Inherited = $ace.IsInherited }
+        }
+    }
+
+    $rootAces = @(Get-DangerousAces -Dn $domainDN -OnlyExplicit $false)
+    if (@($rootAces).Count -gt 0) {
+        Add-FindingWithObjects 'Delegation' 'Critical' (Bi "Non-standard principals with dangerous rights on the domain root" "Nicht-Standard-Prinzipale mit gefaehrlichen Rechten auf der Domain-Root") $rootAces `
+            (Bi "GenericAll/WriteDacl/WriteOwner on the domain root object grants control over the entire domain." "GenericAll/WriteDacl/WriteOwner auf dem Domain-Root-Objekt erlaubt Kontrolle ueber die gesamte Domaene.") `
+            (Bi "Remove unexpected ACEs immediately; investigate how/when they were added." "Unerwartete ACEs sofort entfernen; pruefen wie/wann sie hinzugefuegt wurden.")
+    }
+
+    $ouAces = New-Object System.Collections.ArrayList
+    $ous = Get-ADOrganizationalUnit -Filter * -ErrorAction SilentlyContinue
+    foreach ($ou in $ous) {
+        try {
+            foreach ($ace in (Get-DangerousAces -Dn $ou.DistinguishedName -OnlyExplicit $true)) {
+                if (@($ouAces).Count -lt 200) { [void]$ouAces.Add($ace) }
+            }
+        } catch { }
+    }
+    if (@($ouAces).Count -gt 0) {
+        Add-FindingWithObjects 'Delegation' 'High' (Bi "Non-standard principals with dangerous rights on OUs (explicit delegation)" "Nicht-Standard-Prinzipale mit gefaehrlichen Rechten auf OUs (explizite Delegation)") $ouAces `
+            (Bi "GenericAll/WriteDacl/WriteOwner grants far-reaching control over all objects in that OU (e.g. resetting passwords, group membership, further delegation)." "GenericAll/WriteDacl/WriteOwner erlaubt weitreichende Kontrolle ueber alle Objekte in dieser OU (z.B. Passwort-Reset, Gruppenmitgliedschaft, weitere Delegation).") `
+            (Bi "Review each ACE: intentional delegation vs. leftover/misconfigured. Remove or scope down anything unexpected." "Jede ACE pruefen: gewollte Delegation vs. Altlast/Fehlkonfiguration. Unerwartetes entfernen oder einschraenken.") `
+            (Bi "Only explicitly delegated (non-inherited) ACEs are shown, to avoid duplicate noise from inheritance off the domain root. Display limited to 200 entries." "Nur explizit delegierte (nicht vererbte) ACEs werden angezeigt, um doppeltes Rauschen durch Vererbung von der Domain-Root zu vermeiden. Anzeige auf 200 Eintraege begrenzt.")
+    }
+    if (@($rootAces).Count -eq 0 -and @($ouAces).Count -eq 0) {
+        Add-Finding 'Delegation' 'Info' (Bi "No non-standard dangerous ACEs found on the domain root/OUs" "Keine Nicht-Standard-ACEs mit gefaehrlichen Rechten auf Domain-Root/OUs gefunden") `
+            (Bi "No unexpected GenericAll/WriteDacl/WriteOwner delegation detected." "Keine unerwartete GenericAll/WriteDacl/WriteOwner-Delegation gefunden.") `
+            (Bi "No action needed; re-check after changes." "Keine Aktion noetig; bei Aenderungen erneut pruefen.")
+    }
+} catch { Write-Log "Domain root/OU ACL check failed: $_" 'WARN' }
+
 # --- Generate Report ------------------------------------------------------
 Write-Log "Generating HTML report ..." 'INFO'
 
