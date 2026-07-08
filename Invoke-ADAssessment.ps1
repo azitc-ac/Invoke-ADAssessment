@@ -213,11 +213,36 @@ try {
     $dcdiag = & dcdiag /e /c 2>&1 | Out-String
     Set-Content -Path (Join-Path $OutputPath 'dcdiag.txt') -Value $dcdiag -Encoding UTF8
 
-    # DE + EN Muster (dcdiag ist sprachabhaengig)
-    $failMatches = Select-String -InputObject $dcdiag -Pattern 'failed test|nicht bestanden' -AllMatches
-    if ($failMatches -and $failMatches.Matches.Count -gt 0) {
+    # DE + EN Muster (dcdiag ist sprachabhaengig; interne Testnamen wie 'SystemLog' bleiben unuebersetzt)
+    $failedTests = New-Object System.Collections.ArrayList
+    foreach ($m in (Select-String -InputObject $dcdiag -Pattern '(\S+)\s+failed test\s+(\S+)' -AllMatches).Matches) {
+        [void]$failedTests.Add([pscustomobject]@{ DC = $m.Groups[1].Value; Test = $m.Groups[2].Value })
+    }
+    foreach ($m in (Select-String -InputObject $dcdiag -Pattern '(\S+)\s+hat den Test\s+(\S+)\s+nicht bestanden' -AllMatches).Matches) {
+        [void]$failedTests.Add([pscustomobject]@{ DC = $m.Groups[1].Value; Test = $m.Groups[2].Value })
+    }
+
+    # Generischer Treffertest als Fallback (falls Testname/DC bei abweichender Lokalisierung nicht extrahierbar sind)
+    $genericFail = Select-String -InputObject $dcdiag -Pattern 'failed test|nicht bestanden' -AllMatches
+
+    if (@($failedTests).Count -gt 0) {
+        # Bekannt "geschwaetzige" Tests: schlagen oft schon bei harmlosen Eventlog-Warnungen an (haeufig transient)
+        $noisyTests = @('SystemLog','DFSREvent')
+        $other = @($failedTests | Where-Object { $_.Test -notin $noisyTests })
+        $noisy = @($failedTests | Where-Object { $_.Test -in $noisyTests })
+
+        if (@($other).Count -gt 0) {
+            Add-FindingWithObjects 'Health' 'High' "dcdiag meldet fehlgeschlagene Tests" $other `
+                "Siehe dcdiag.txt fuer den Volltext je Test." "Fehlgeschlagene DC-Tests einzeln untersuchen."
+        }
+        if (@($noisy).Count -gt 0) {
+            Add-FindingWithObjects 'Health' 'Medium' "dcdiag: SystemLog/DFSREvent-Warnungen" $noisy `
+                "SystemLog/DFSREvent schlagen haeufig schon bei harmlosen Eventlog-Warnungen an - oft transient." `
+                "System-/DFSR-Eventlog auf dem betroffenen DC pruefen; bei wiederholtem Auftreten ueber mehrere Laeufe genauer untersuchen."
+        }
+    } elseif ($genericFail -and $genericFail.Matches.Count -gt 0) {
         Add-Finding 'Health' 'High' "dcdiag meldet fehlgeschlagene Tests" `
-            "$($failMatches.Matches.Count) Treffer. Siehe dcdiag.txt." "Fehlgeschlagene DC-Tests einzeln untersuchen."
+            "$($genericFail.Matches.Count) Treffer. Siehe dcdiag.txt." "Fehlgeschlagene DC-Tests einzeln untersuchen."
     }
 } catch { Write-Log "dcdiag fehlgeschlagen: $_" 'WARN' }
 
