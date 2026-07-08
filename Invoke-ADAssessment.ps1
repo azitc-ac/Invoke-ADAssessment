@@ -48,7 +48,7 @@ function Write-Log {
 # omitted it falls back to $En (keeps language-neutral tokens like numbers working
 # without a separate German copy at every call site).
 function Bi {
-    param([Parameter(Mandatory=$true)][string]$En, [string]$De = '')
+    param([string]$En = '', [string]$De = '')
     if ([string]::IsNullOrEmpty($De)) { $De = $En }
     return [pscustomobject]@{ EN = $En; DE = $De }
 }
