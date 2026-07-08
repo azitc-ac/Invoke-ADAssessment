@@ -322,7 +322,7 @@ try {
     # Kerberoastable: user accounts with an SPN (excluding krbtgt)
     $spnUsers = Get-ADUser -Filter { ServicePrincipalName -like '*' -and Enabled -eq $true } -Properties ServicePrincipalName, PasswordLastSet |
         Where-Object { $_.SamAccountName -ne 'krbtgt' } |
-        Select-Object SamAccountName, PasswordLastSet, @{n='SPNs';e={ ($_.ServicePrincipalName -join '; ') }}
+        Select-Object SamAccountName, PasswordLastSet, @{n='SPNs';e={ ($_.ServicePrincipalName -join '; ') }}, DistinguishedName
     if (@($spnUsers).Count -gt 0) {
         Add-FindingWithObjects 'Kerberos' 'High' (Bi "User accounts with an SPN (Kerberoasting risk)" "User-Konten mit SPN (Kerberoasting-Risiko)") $spnUsers `
             (Bi "Service accounts with an SPN can be attacked offline (Kerberoasting)." "Service-Konten mit SPN sind offline angreifbar (Kerberoasting).") `
@@ -331,7 +331,7 @@ try {
 
     # AS-REP roasting: no Kerberos pre-auth (UAC bit 0x400000 = DONT_REQ_PREAUTH)
     $asrep = Get-ADUser -LDAPFilter '(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=4194304)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' |
-        Select-Object SamAccountName
+        Select-Object SamAccountName, DistinguishedName
     if (@($asrep).Count -gt 0) {
         Add-FindingWithObjects 'Kerberos' 'High' (Bi "Accounts without Kerberos pre-auth (AS-REP roasting risk)" "Konten ohne Kerberos-Pre-Auth (AS-REP-Roasting-Risiko)") $asrep `
             (Bi "AS-REP roasting is possible." "AS-REP-Roasting moeglich.") `
@@ -340,7 +340,7 @@ try {
 
     # Unconstrained delegation (excluding DCs)
     $unconstrained = Get-ADComputer -Filter { TrustedForDelegation -eq $true } -Properties TrustedForDelegation, PrimaryGroupID |
-        Where-Object { $_.PrimaryGroupID -ne 516 } | Select-Object Name, DNSHostName
+        Where-Object { $_.PrimaryGroupID -ne 516 } | Select-Object Name, DNSHostName, DistinguishedName
     if (@($unconstrained).Count -gt 0) {
         Add-FindingWithObjects 'Delegation' 'Critical' (Bi "Objects with unconstrained delegation" "Objekte mit Unconstrained Delegation") $unconstrained `
             (Bi "Allows impersonation up to Tier 0." "Erlaubt Impersonation bis Tier 0.") `
@@ -368,28 +368,28 @@ $cutoff = (Get-Date).AddDays(-$InactiveDays)
 try {
     $inactiveUsers = Get-ADUser -Filter { Enabled -eq $true } -Properties LastLogonTimestamp |
         Where-Object { $_.LastLogonTimestamp -and ([datetime]::FromFileTime($_.LastLogonTimestamp) -lt $cutoff) } |
-        Select-Object SamAccountName, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}
+        Select-Object SamAccountName, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}, DistinguishedName
     if (@($inactiveUsers).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'Medium' (Bi "active users inactive for >$InactiveDays days" "aktive User seit >$InactiveDays Tagen inaktiv") $inactiveUsers `
             (Bi "Stale accounts enlarge the attack surface." "Stale-Konten vergroessern die Angriffsflaeche.") `
             (Bi "Establish a disable/delete (lifecycle) process." "Deaktivierungs-/Loeschprozess (Lifecycle) etablieren.")
     }
 
-    $neverExpire = Get-ADUser -Filter { Enabled -eq $true -and PasswordNeverExpires -eq $true } | Select-Object SamAccountName
+    $neverExpire = Get-ADUser -Filter { Enabled -eq $true -and PasswordNeverExpires -eq $true } | Select-Object SamAccountName, DistinguishedName
     if (@($neverExpire).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'Medium' (Bi "Accounts with 'Password never expires'" "Konten mit 'Password never expires'") $neverExpire `
             (Bi "Permanent passwords." "Dauerpasswoerter.") `
             (Bi "Justify exceptions; use gMSA/managed accounts." "Ausnahmen begruenden; gMSA/Managed-Accounts nutzen.")
     }
 
-    $pwNotReq = Get-ADUser -Filter { PasswordNotRequired -eq $true -and Enabled -eq $true } | Select-Object SamAccountName
+    $pwNotReq = Get-ADUser -Filter { PasswordNotRequired -eq $true -and Enabled -eq $true } | Select-Object SamAccountName, DistinguishedName
     if (@($pwNotReq).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'High' (Bi "Accounts with 'PasswordNotRequired'" "Konten mit 'PasswordNotRequired'") $pwNotReq `
             (Bi "Accounts without a password requirement." "Konten ohne Passwortzwang.") `
             (Bi "Clean up the attribute." "Attribut bereinigen.")
     }
 
-    $reversible = Get-ADUser -Filter { AllowReversiblePasswordEncryption -eq $true -and Enabled -eq $true } | Select-Object SamAccountName
+    $reversible = Get-ADUser -Filter { AllowReversiblePasswordEncryption -eq $true -and Enabled -eq $true } | Select-Object SamAccountName, DistinguishedName
     if (@($reversible).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'High' (Bi "Accounts with reversible encryption" "Konten mit reversibler Verschluesselung") $reversible `
             (Bi "Passwords are effectively stored in cleartext." "Passwoerter praktisch im Klartext.") `
@@ -398,7 +398,7 @@ try {
 
     $inactiveComputers = Get-ADComputer -Filter { Enabled -eq $true } -Properties LastLogonTimestamp, OperatingSystem |
         Where-Object { $_.LastLogonTimestamp -and ([datetime]::FromFileTime($_.LastLogonTimestamp) -lt $cutoff) } |
-        Select-Object Name, OperatingSystem, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}
+        Select-Object Name, OperatingSystem, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}, DistinguishedName
     if (@($inactiveComputers).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'Low' (Bi "inactive computer accounts (>$InactiveDays days)" "inaktive Computerkonten (>$InactiveDays Tage)") $inactiveComputers `
             (Bi "Orphaned computer objects." "Verwaiste Computerobjekte.") `
@@ -408,7 +408,7 @@ try {
     # Legacy OS computers
     $legacyOS = Get-ADComputer -Filter { Enabled -eq $true } -Properties OperatingSystem |
         Where-Object { $_.OperatingSystem -match 'XP|Vista|2003|2008|Windows 7|Windows 8' } |
-        Select-Object Name, OperatingSystem
+        Select-Object Name, OperatingSystem, DistinguishedName
     if (@($legacyOS).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'High' (Bi "Machines with an EOL operating system" "Rechner mit EOL-Betriebssystem") $legacyOS `
             (Bi "Unpatched legacy systems." "Ungepatchte Legacy-Systeme.") `
@@ -697,7 +697,7 @@ try {
                 if ($val) { $has = $true; break }
             }
             if ($has) { $withLaps++ } else {
-                if (@($missing).Count -lt 200) { [void]$missing.Add([pscustomobject]@{ Name = $c.Name; OS = $c.OperatingSystem }) }
+                if (@($missing).Count -lt 200) { [void]$missing.Add([pscustomobject]@{ Name = $c.Name; OS = $c.OperatingSystem; DistinguishedName = $c.DistinguishedName }) }
             }
         }
         if ($checked -gt 0) {
