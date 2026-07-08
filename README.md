@@ -9,12 +9,13 @@ Built as a lightweight companion to tools like [Purple Knight](https://www.sempe
 ## Features
 
 - **Health & operations:** FSMO roles, DC inventory, `dcdiag` / `repadmin` (read only), functional levels
-- **Security & attack paths:** privileged group membership, Kerberoasting & AS-REP candidates, unconstrained delegation, DCSync rights on the domain NC, krbtgt password age
+- **Security & attack paths:** privileged group membership, Kerberoasting & AS-REP candidates, unconstrained delegation, DCSync rights on the domain NC, krbtgt password age, dangerous ACEs (GenericAll/WriteDacl/WriteOwner) on AdminSDHolder, the domain root and OUs held by non-Tier-0 principals
 - **Hygiene:** inactive accounts, "password never expires", `PasswordNotRequired`, reversible encryption, GPP passwords in SYSVOL (MS14-025), LAPS deployment coverage
 - **Hardening:** SMBv1, LDAP signing & channel binding, LmCompatibilityLevel (read from the PDC)
 - **AD CS detection:** enterprise CA discovery (host, IP, subject DN) as a pointer to run [Locksmith](https://github.com/jakehildreth/Locksmith)
 - **Soll/Ist compliance table:** actual vs. recommended for every measurable setting, colour-coded (green = better, black = meets, yellow = borderline, red = action needed), each row citing its source (CIS Benchmark, Microsoft, Defender for Identity)
 - **Jump links:** every finding links to the list of affected objects
+- **Bilingual report:** English/German toggle in the HTML report (defaults to English); the console/log output and script itself are English
 - **Output:** `ADAssessment_Report.html`, plus `Findings.csv` and `Compliance.csv`
 
 ## Requirements
