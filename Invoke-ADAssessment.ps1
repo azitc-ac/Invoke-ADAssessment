@@ -22,6 +22,10 @@
 .PARAMETER InactiveDays
     Threshold (days) for inactive accounts. Default 90.
 
+.PARAMETER CurrentDomainOnly
+    Restrict the account hygiene check (section 7) to the current domain only.
+    Default is off, i.e. the check iterates every domain in the forest.
+
 .NOTES
     Author: AZITC (Alexander Zarenko IT Consulting)
     Save file as UTF-8 with BOM.
@@ -30,7 +34,8 @@
 [CmdletBinding()]
 param(
     [string]$OutputPath = ".\ADAssessment_$(Get-Date -Format 'yyyyMMdd_HHmmss')",
-    [int]$InactiveDays = 90
+    [int]$InactiveDays = 90,
+    [switch]$CurrentDomainOnly
 )
 
 $ErrorActionPreference = 'Continue'
@@ -128,6 +133,23 @@ function Get-BiText {
     return [string]$Value
 }
 
+# Resolves an ACE's IdentityReference to its SID and checks it against a well-known-SID
+# allowlist. Comparing by SID instead of by localized/display name (the previous approach)
+# avoids both false positives (a non-English "Domain Admins" translation not matching an
+# English name list) and false negatives (a same-named group elsewhere matching by name alone).
+# An identity that can't be resolved to a SID is treated as NOT known (safe default: report it
+# rather than silently clear it).
+function Test-KnownSid {
+    param($IdentityReference, [string[]]$KnownSids)
+    if (-not $KnownSids) { return $false }
+    $val = $IdentityReference.Value
+    $sid = if ($val -match '^S-1-') { $val } else {
+        try { $IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { $null }
+    }
+    if (-not $sid) { return $false }
+    return ($KnownSids -contains $sid)
+}
+
 function Add-Section {
     param($Title, [object]$Data, $Note = (Bi '' ''), [string]$Anchor = '')
     [void]$script:Sections.Add([pscustomobject]@{
@@ -188,6 +210,37 @@ if (-not (Test-Path $OutputPath)) {
 }
 $OutputPath = (Resolve-Path $OutputPath).Path
 Write-Log "Report folder: $OutputPath" 'INFO'
+
+# Well-known SIDs used to tell legitimate Tier-0/replication principals apart from everyone
+# else in the ACL-based checks (DCSync, AdminSDHolder, domain root/OU dangerous ACEs). Built
+# once here from the domain/root-domain SID rather than compared by name, since well-known
+# group *names* are locale-dependent (e.g. a German-language domain's "Domain Admins" group
+# can be created as "Domaenen-Admins") while the RID relative to the domain SID is not.
+try {
+    $domainSidStr = (Get-ADDomain).DomainSID.Value
+    $rootDomainDns = (Get-ADForest).RootDomain
+    $rootDomainSidStr = (Get-ADDomain -Identity $rootDomainDns).DomainSID.Value
+
+    # Allowed to hold GenericAll/WriteDacl/WriteOwner on the domain root/AdminSDHolder/OUs.
+    # Deliberately narrow: DCs and Schema Admins are not expected to hold these rights there,
+    # so they are NOT included (unlike the wider replication allowlist below).
+    $script:Tier0Sids = @(
+        'S-1-5-18',              # SYSTEM
+        'S-1-5-32-544',          # BUILTIN\Administrators
+        "$domainSidStr-512",     # Domain Admins
+        "$rootDomainSidStr-519"  # Enterprise Admins
+    )
+    # Allowed to hold DS-Replication-Get-Changes[-All] (DCs legitimately replicate).
+    $script:ReplicationLegitSids = $script:Tier0Sids + @(
+        "$domainSidStr-516",     # Domain Controllers
+        "$domainSidStr-521",     # Read-only Domain Controllers
+        "$rootDomainSidStr-498"  # Enterprise Read-only Domain Controllers
+    )
+} catch {
+    Write-Log "Could not resolve well-known Tier-0/replication SIDs: $_. ACL/DCSync checks will treat every principal as non-standard until this is resolved - expect noisy findings that need manual triage rather than a silent false-clear." 'WARN'
+    $script:Tier0Sids = $null
+    $script:ReplicationLegitSids = $null
+}
 
 # --- 1. Forest / Domain / FSMO ---------------------------------------------
 Write-Log "Collecting forest/domain/FSMO ..." 'INFO'
@@ -366,49 +419,78 @@ try {
 Write-Log "Checking account hygiene ..." 'INFO'
 $cutoff = (Get-Date).AddDays(-$InactiveDays)
 try {
-    $inactiveUsers = Get-ADUser -Filter { Enabled -eq $true } -Properties LastLogonTimestamp |
-        Where-Object { $_.LastLogonTimestamp -and ([datetime]::FromFileTime($_.LastLogonTimestamp) -lt $cutoff) } |
-        Select-Object SamAccountName, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}, DistinguishedName
+    if ($CurrentDomainOnly) {
+        $hygieneDomains = @((Get-ADDomain).DNSRoot)
+    } else {
+        $hygieneDomains = @((Get-ADForest).Domains)
+    }
+    Write-Log ("Account hygiene scope: {0} ({1})" -f ($hygieneDomains -join ', '), $(if ($CurrentDomainOnly) { 'current domain only' } else { 'whole forest' })) 'INFO'
+
+    $inactiveUsers     = New-Object System.Collections.ArrayList
+    $neverExpire       = New-Object System.Collections.ArrayList
+    $pwNotReq          = New-Object System.Collections.ArrayList
+    $reversible        = New-Object System.Collections.ArrayList
+    $inactiveComputers = New-Object System.Collections.ArrayList
+    $legacyOS          = New-Object System.Collections.ArrayList
+
+    foreach ($dom in $hygieneDomains) {
+        try {
+            $inactiveUsers.AddRange(@(Get-ADUser -Server $dom -Filter { Enabled -eq $true } -Properties LastLogonTimestamp |
+                Where-Object { $_.LastLogonTimestamp -and ([datetime]::FromFileTime($_.LastLogonTimestamp) -lt $cutoff) } |
+                Select-Object SamAccountName, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}, DistinguishedName, @{n='Domain';e={ $dom }}))
+
+            $neverExpire.AddRange(@(Get-ADUser -Server $dom -Filter { Enabled -eq $true -and PasswordNeverExpires -eq $true } |
+                Select-Object SamAccountName, DistinguishedName, @{n='Domain';e={ $dom }}))
+
+            $pwNotReq.AddRange(@(Get-ADUser -Server $dom -Filter { PasswordNotRequired -eq $true -and Enabled -eq $true } |
+                Select-Object SamAccountName, DistinguishedName, @{n='Domain';e={ $dom }}))
+
+            $reversible.AddRange(@(Get-ADUser -Server $dom -Filter { AllowReversiblePasswordEncryption -eq $true -and Enabled -eq $true } |
+                Select-Object SamAccountName, DistinguishedName, @{n='Domain';e={ $dom }}))
+
+            $inactiveComputers.AddRange(@(Get-ADComputer -Server $dom -Filter { Enabled -eq $true } -Properties LastLogonTimestamp, OperatingSystem |
+                Where-Object { $_.LastLogonTimestamp -and ([datetime]::FromFileTime($_.LastLogonTimestamp) -lt $cutoff) } |
+                Select-Object Name, OperatingSystem, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}, DistinguishedName, @{n='Domain';e={ $dom }}))
+
+            # Legacy OS computers
+            $legacyOS.AddRange(@(Get-ADComputer -Server $dom -Filter { Enabled -eq $true } -Properties OperatingSystem |
+                Where-Object { $_.OperatingSystem -match 'XP|Vista|2003|2008|Windows 7|Windows 8' } |
+                Select-Object Name, OperatingSystem, DistinguishedName, @{n='Domain';e={ $dom }}))
+        } catch { Write-Log "Account hygiene query against domain '$dom' failed: $_" 'WARN' }
+    }
+
     if (@($inactiveUsers).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'Medium' (Bi "active users inactive for >$InactiveDays days" "aktive User seit >$InactiveDays Tagen inaktiv") $inactiveUsers `
             (Bi "Stale accounts enlarge the attack surface." "Stale-Konten vergroessern die Angriffsflaeche.") `
-            (Bi "Establish a disable/delete (lifecycle) process." "Deaktivierungs-/Loeschprozess (Lifecycle) etablieren.")
+            (Bi "Establish a disable/delete (lifecycle) process." "Deaktivierungs-/Loeschprozess (Lifecycle) etablieren.") `
+            (Bi "LastLogonTimestamp replicates only every ~9-14 days, so a given account's last logon can be up to that much more recent than shown; treat this as an approximation, not an exact value." "LastLogonTimestamp repliziert nur alle ca. 9-14 Tage - der tatsaechliche letzte Logon kann entsprechend juenger sein als angezeigt. Als Naeherung, nicht als exakten Wert betrachten.")
     }
 
-    $neverExpire = Get-ADUser -Filter { Enabled -eq $true -and PasswordNeverExpires -eq $true } | Select-Object SamAccountName, DistinguishedName
     if (@($neverExpire).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'Medium' (Bi "Accounts with 'Password never expires'" "Konten mit 'Password never expires'") $neverExpire `
             (Bi "Permanent passwords." "Dauerpasswoerter.") `
             (Bi "Justify exceptions; use gMSA/managed accounts." "Ausnahmen begruenden; gMSA/Managed-Accounts nutzen.")
     }
 
-    $pwNotReq = Get-ADUser -Filter { PasswordNotRequired -eq $true -and Enabled -eq $true } | Select-Object SamAccountName, DistinguishedName
     if (@($pwNotReq).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'High' (Bi "Accounts with 'PasswordNotRequired'" "Konten mit 'PasswordNotRequired'") $pwNotReq `
             (Bi "Accounts without a password requirement." "Konten ohne Passwortzwang.") `
             (Bi "Clean up the attribute." "Attribut bereinigen.")
     }
 
-    $reversible = Get-ADUser -Filter { AllowReversiblePasswordEncryption -eq $true -and Enabled -eq $true } | Select-Object SamAccountName, DistinguishedName
     if (@($reversible).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'High' (Bi "Accounts with reversible encryption" "Konten mit reversibler Verschluesselung") $reversible `
             (Bi "Passwords are effectively stored in cleartext." "Passwoerter praktisch im Klartext.") `
             (Bi "Disable reversible encryption." "Reversible Encryption deaktivieren.")
     }
 
-    $inactiveComputers = Get-ADComputer -Filter { Enabled -eq $true } -Properties LastLogonTimestamp, OperatingSystem |
-        Where-Object { $_.LastLogonTimestamp -and ([datetime]::FromFileTime($_.LastLogonTimestamp) -lt $cutoff) } |
-        Select-Object Name, OperatingSystem, @{n='LastLogon';e={ [datetime]::FromFileTime($_.LastLogonTimestamp) }}, DistinguishedName
     if (@($inactiveComputers).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'Low' (Bi "inactive computer accounts (>$InactiveDays days)" "inaktive Computerkonten (>$InactiveDays Tage)") $inactiveComputers `
             (Bi "Orphaned computer objects." "Verwaiste Computerobjekte.") `
-            (Bi "Clean up/disable." "Bereinigen/deaktivieren.")
+            (Bi "Clean up/disable." "Bereinigen/deaktivieren.") `
+            (Bi "LastLogonTimestamp replicates only every ~9-14 days, so a given computer's last logon can be up to that much more recent than shown; treat this as an approximation, not an exact value." "LastLogonTimestamp repliziert nur alle ca. 9-14 Tage - der tatsaechliche letzte Logon kann entsprechend juenger sein als angezeigt. Als Naeherung, nicht als exakten Wert betrachten.")
     }
 
-    # Legacy OS computers
-    $legacyOS = Get-ADComputer -Filter { Enabled -eq $true } -Properties OperatingSystem |
-        Where-Object { $_.OperatingSystem -match 'XP|Vista|2003|2008|Windows 7|Windows 8' } |
-        Select-Object Name, OperatingSystem, DistinguishedName
     if (@($legacyOS).Count -gt 0) {
         Add-FindingWithObjects 'Hygiene' 'High' (Bi "Machines with an EOL operating system" "Rechner mit EOL-Betriebssystem") $legacyOS `
             (Bi "Unpatched legacy systems." "Ungepatchte Legacy-Systeme.") `
@@ -601,35 +683,46 @@ try {
         (Bi "Verify the backup solution: regular system-state backup of >=1 DC, a documented and PRACTICED forest recovery plan, DSRM password governance." "Backup-Loesung pruefen: regelmaessiges Systemstate-Backup >=1 DC, dokumentierter & GEUEBTER Forest-Recovery-Plan, DSRM-Passwort-Governance.")
 } catch { Write-Log "Backup/DR check failed: $_" 'WARN' }
 
-# --- 14. DCSync Rights (DS-Replication-Get-Changes-All) ------------------------
+# --- 14. DCSync Rights (DS-Replication-Get-Changes[-All] / GenericAll) ---------
 Write-Log "Checking DCSync rights on the domain NC ..." 'INFO'
 try {
     $domainDN = (Get-ADDomain).DistinguishedName
-    # Extended rights GUIDs
+    # Extended rights GUIDs. DCSync requires BOTH of the first two (a principal holding only one
+    # doesn't yet have full DCSync capability, but either one alone is still worth flagging since
+    # it's a step toward it and often added/removed together by delegation tooling anyway).
+    # GenericAll and the all-zero ObjectType (= "every extended right", used when an ACE grants
+    # ExtendedRight without naming a specific one) both imply both replication rights without
+    # ever naming their GUIDs, so a GUID-only check misses them entirely.
     $guidGetChangesAll = [guid]'1131f6ad-9c07-11d1-f79f-00c04fc2dcd2' # DS-Replication-Get-Changes-All
+    $guidGetChanges    = [guid]'1131f6aa-9c07-11d1-f79f-00c04fc2dcd2' # DS-Replication-Get-Changes
+    $guidZero          = [guid]'00000000-0000-0000-0000-000000000000'
     $acl = Get-Acl -Path ("AD:\" + $domainDN) -ErrorAction Stop
 
-    # Known, legitimate principals allowed to perform DCSync
-    $legit = @('Domain Admins','Enterprise Admins','Administrators','Domain Controllers',
-               'Enterprise Read-only Domain Controllers','SYSTEM','Read-only Domain Controllers')
-
     $dcsync = foreach ($ace in $acl.Access) {
-        if ($ace.ObjectType -eq $guidGetChangesAll -and $ace.AccessControlType -eq 'Allow') {
-            $id = $ace.IdentityReference.Value
-            $short = ($id -split '\\')[-1]
-            if ($legit -notcontains $short) {
-                [pscustomobject]@{ Principal = $id; Right = 'DS-Replication-Get-Changes-All'; Type = $ace.AccessControlType }
-            }
+        if ($ace.AccessControlType -ne 'Allow') { continue }
+        $rightsStr = "$($ace.ActiveDirectoryRights)"
+        $grantsGenericAll  = ($rightsStr -match 'GenericAll')
+        $grantsAllExtended = ($ace.ObjectType -eq $guidZero -and $rightsStr -match 'ExtendedRight')
+        $grantsChangesAll  = ($ace.ObjectType -eq $guidGetChangesAll)
+        $grantsChanges     = ($ace.ObjectType -eq $guidGetChanges)
+        if (-not ($grantsGenericAll -or $grantsAllExtended -or $grantsChangesAll -or $grantsChanges)) { continue }
+
+        if (-not (Test-KnownSid $ace.IdentityReference $script:ReplicationLegitSids)) {
+            $rightLabel = if ($grantsGenericAll) { 'GenericAll (implies all extended rights, incl. both DCSync rights)' }
+                elseif ($grantsAllExtended) { 'ExtendedRight, all rights (zero ObjectType GUID; incl. both DCSync rights)' }
+                elseif ($grantsChangesAll) { 'DS-Replication-Get-Changes-All' }
+                else { 'DS-Replication-Get-Changes' }
+            [pscustomobject]@{ Principal = $ace.IdentityReference.Value; Right = $rightLabel; Type = $ace.AccessControlType }
         }
     }
     if (@($dcsync).Count -gt 0) {
-        Add-FindingWithObjects 'Delegation' 'Critical' (Bi "Non-standard principals with DCSync rights" "Nicht-Standard-Prinzipale mit DCSync-Recht") $dcsync `
-            (Bi "DS-Replication-Get-Changes-All allows reading all password hashes (DCSync)." "DS-Replication-Get-Changes-All erlaubt das Auslesen aller Passwort-Hashes (DCSync).") `
-            (Bi "Restrict the right to DCs/DAs; remove unexpected principals immediately." "Recht auf DCs/DAs beschraenken; unerwartete Prinzipale sofort entfernen.") `
-            (Bi "Legitimate standard principals (DAs/EAs/DCs/SYSTEM) are already filtered out." "Legitime Standard-Prinzipale (DAs/EAs/DCs/SYSTEM) sind ausgefiltert.")
+        Add-FindingWithObjects 'Delegation' 'Critical' (Bi "Non-standard principals with DCSync-capable rights" "Nicht-Standard-Prinzipale mit DCSync-faehigen Rechten") $dcsync `
+            (Bi "Full DCSync needs BOTH DS-Replication-Get-Changes and -Get-Changes-All; GenericAll or an all-rights ExtendedRight ACE implies both at once. Any of these on a non-standard principal allows reading all password hashes (DCSync) or is a step toward it." "Vollstaendiges DCSync benoetigt SOWOHL DS-Replication-Get-Changes ALS AUCH -Get-Changes-All; GenericAll oder eine All-Rights-ExtendedRight-ACE impliziert beides gleichzeitig. Jedes davon bei einem Nicht-Standard-Prinzipal erlaubt das Auslesen aller Passwort-Hashes (DCSync) oder ist ein Schritt dorthin.") `
+            (Bi "Restrict these rights to DCs/DAs; remove unexpected principals immediately." "Diese Rechte auf DCs/DAs beschraenken; unerwartete Prinzipale sofort entfernen.") `
+            (Bi "Legitimate principals (DAs/EAs/DCs/RODCs/SYSTEM/Administrators) are filtered out by well-known SID, not by name." "Legitime Prinzipale (DAs/EAs/DCs/RODCs/SYSTEM/Administrators) werden anhand well-known SIDs ausgefiltert, nicht anhand des Namens.")
     } else {
-        Add-Finding 'Delegation' 'Info' (Bi "No non-standard DCSync rights found" "Keine Nicht-Standard-DCSync-Rechte gefunden") `
-            (Bi "Only the expected principals hold DS-Replication-Get-Changes-All." "Nur erwartete Prinzipale besitzen DS-Replication-Get-Changes-All.") `
+        Add-Finding 'Delegation' 'Info' (Bi "No non-standard DCSync-capable rights found" "Keine Nicht-Standard-DCSync-faehigen Rechte gefunden") `
+            (Bi "Only the expected principals hold DS-Replication-Get-Changes, -Get-Changes-All, or an equivalent GenericAll/all-rights ACE." "Nur erwartete Prinzipale besitzen DS-Replication-Get-Changes, -Get-Changes-All oder eine gleichwertige GenericAll-/All-Rights-ACE.") `
             (Bi "No action needed; re-check after changes." "Keine Aktion noetig; bei Aenderungen erneut pruefen.")
     }
 } catch { Write-Log "DCSync check failed (AD PSDrive/permissions?): $_" 'WARN' }
@@ -718,16 +811,13 @@ try {
 # --- 17. AdminSDHolder ACL - Dangerous ACEs -------------------------------------
 Write-Log "Checking AdminSDHolder ACL for dangerous ACEs ..." 'INFO'
 try {
-    $tier0Principals = @('Domain Admins','Enterprise Admins','Administrators','SYSTEM')
     $sdHolderDN = "CN=AdminSDHolder,CN=System," + (Get-ADDomain).DistinguishedName
     $sdAcl = Get-Acl -Path ("AD:\" + $sdHolderDN) -ErrorAction Stop
 
     $sdDangerous = foreach ($ace in $sdAcl.Access) {
         if ($ace.AccessControlType -eq 'Allow' -and "$($ace.ActiveDirectoryRights)" -match 'GenericAll|WriteDacl|WriteOwner') {
-            $id = $ace.IdentityReference.Value
-            $short = ($id -split '\\')[-1]
-            if ($tier0Principals -notcontains $short) {
-                [pscustomobject]@{ Principal = $id; Rights = "$($ace.ActiveDirectoryRights)"; Inherited = $ace.IsInherited }
+            if (-not (Test-KnownSid $ace.IdentityReference $script:Tier0Sids)) {
+                [pscustomobject]@{ Principal = $ace.IdentityReference.Value; Rights = "$($ace.ActiveDirectoryRights)"; Inherited = $ace.IsInherited }
             }
         }
     }
@@ -746,7 +836,6 @@ try {
 # --- 18. Domain Root / OU ACL Hardening (Dangerous ACEs) ------------------------
 Write-Log "Checking domain root and OU ACLs for dangerous delegated rights ..." 'INFO'
 try {
-    $tier0Principals = @('Domain Admins','Enterprise Admins','Administrators','SYSTEM')
     $domainDN = (Get-ADDomain).DistinguishedName
 
     # Returns dangerous (GenericAll/WriteDacl/WriteOwner) Allow ACEs held by non-Tier-0 principals.
@@ -759,10 +848,8 @@ try {
             if ($ace.AccessControlType -ne 'Allow') { continue }
             if ($OnlyExplicit -and $ace.IsInherited) { continue }
             if ("$($ace.ActiveDirectoryRights)" -notmatch 'GenericAll|WriteDacl|WriteOwner') { continue }
-            $id = $ace.IdentityReference.Value
-            $short = ($id -split '\\')[-1]
-            if ($tier0Principals -contains $short) { continue }
-            [pscustomobject]@{ Object = $Dn; Principal = $id; Rights = "$($ace.ActiveDirectoryRights)"; Inherited = $ace.IsInherited }
+            if (Test-KnownSid $ace.IdentityReference $script:Tier0Sids) { continue }
+            [pscustomobject]@{ Object = $Dn; Principal = $ace.IdentityReference.Value; Rights = "$($ace.ActiveDirectoryRights)"; Inherited = $ace.IsInherited }
         }
     }
 
