@@ -309,6 +309,24 @@ try {
     # Generic hit-count fallback (in case test name/DC can't be extracted due to unexpected localization)
     $genericFail = Select-String -InputObject $dcdiag -Pattern 'failed test|nicht bestanden' -AllMatches
 
+    # Locale sanity check: dcdiag's internal test names (Connectivity, SystemLog, DFSREvent, ...)
+    # are never translated, only the surrounding pass/fail sentence is. If neither the EN nor the
+    # DE pattern above matched anything, but the output still contains recognizable per-test summary
+    # rows (the "......... <DC> <verb-phrase> <TestName>" dotted-leader line dcdiag emits in every
+    # locale), this is a third language this script has no fail-phrase for - meaning PASS/FAIL genuinely
+    # could not be read from the text. Reporting nothing in that case would be a silent false-clear,
+    # so surface it explicitly instead of guessing at an unverified pass/fail heuristic for that locale.
+    $knownDcdiagTests = @('Connectivity','Advertising','FrsEvent','DFSREvent','SysVolCheck','KccEvent',
+        'KnowsOfRoleHolders','MachineAccount','NCSecDesc','NetLogons','ObjectsReplicated','Replications',
+        'RidManager','Services','SystemLog','VerifyReferences','CheckSDRefDom','CrossRefValidation',
+        'LocatorCheck','Intersite','FSMOCheck','DNS','Topology','VerifyEnterpriseReferences','VerifyReplicas')
+    $recognizedLocale = $false
+    if (@($failedTests).Count -eq 0 -and (-not $genericFail -or $genericFail.Matches.Count -eq 0)) {
+        foreach ($testName in $knownDcdiagTests) {
+            if ($dcdiag -match "\.{5,}\s*\S+[^\r\n]*\b$testName\b") { $recognizedLocale = $true; break }
+        }
+    }
+
     if (@($failedTests).Count -gt 0) {
         # Known "noisy" tests: often fail on harmless eventlog warnings alone (usually transient)
         $noisyTests = @('SystemLog','DFSREvent')
@@ -327,6 +345,10 @@ try {
     } elseif ($genericFail -and $genericFail.Matches.Count -gt 0) {
         Add-Finding 'Health' 'High' (Bi "dcdiag reports failed tests" "dcdiag meldet fehlgeschlagene Tests") `
             (Bi "$($genericFail.Matches.Count) match(es). See dcdiag.txt." "$($genericFail.Matches.Count) Treffer. Siehe dcdiag.txt.") (Bi "Investigate each failed DC test individually." "Fehlgeschlagene DC-Tests einzeln untersuchen.")
+    } elseif ($recognizedLocale) {
+        Add-Finding 'Health' 'Medium' (Bi "dcdiag output is in an unrecognized language - pass/fail could not be determined" "dcdiag-Ausgabe in nicht erkannter Sprache - Pass/Fail konnte nicht bestimmt werden") `
+            (Bi "Known test names (e.g. Connectivity, SystemLog) were found in the output, but neither the English 'failed test' nor the German 'nicht bestanden' phrasing matched - this is a third locale this script has no fail-phrase for. This does NOT mean all tests passed; it means pass/fail could not be read from the text at all." "Bekannte Testnamen (z.B. Connectivity, SystemLog) wurden in der Ausgabe gefunden, aber weder die englische Formulierung 'failed test' noch die deutsche 'nicht bestanden' haben gegriffen - also eine dritte Sprache, fuer die dieses Skript keine Fail-Formulierung kennt. Das bedeutet NICHT, dass alle Tests bestanden wurden, sondern dass Pass/Fail ueberhaupt nicht aus dem Text gelesen werden konnte.") `
+            (Bi "Open dcdiag.txt and check it manually, or re-run with the DC's OS UI language set to English or German so this script can parse the result." "dcdiag.txt oeffnen und manuell pruefen, oder mit auf Englisch oder Deutsch gestellter OS-UI-Sprache des DC erneut ausfuehren, damit dieses Skript das Ergebnis parsen kann.")
     }
 } catch { Write-Log "dcdiag failed: $_" 'WARN' }
 
