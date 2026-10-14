@@ -200,9 +200,11 @@ if ($tcp.Ok) {
 
 $ctlReachable = $tcp.Ok
 if (-not $ctlReachable -and $mechanismActive) {
-    Write-Host '  => ctldl is unreachable AND auto-update is active. During an LDAPS' -ForegroundColor Red
-    Write-Host '     handshake the CTL engine will wait out its full soft-fail timeout' -ForegroundColor Red
-    Write-Host '     (~15 s on the first bind, then cached). This is the cause.' -ForegroundColor Red
+    Write-Host '  => ctldl is unreachable and auto-update is active. An LDAPS bind whose' -ForegroundColor Red
+    Write-Host '     certificate chain triggers a CTL fetch - a root NOT already trusted' -ForegroundColor Red
+    Write-Host '     locally - then waits out the full soft-fail timeout (~15 s, then cached).' -ForegroundColor Red
+    Write-Host '     A cert chaining to a locally-trusted (internal-CA) root needs no fetch' -ForegroundColor Red
+    Write-Host '     and stays fast. Section D (-Capture) measures what THIS DC actually does.' -ForegroundColor Red
 }
 elseif ($ctlReachable) {
     Write-Host '  => ctldl is reachable here, so the CTL fetch is not what slows LDAPS' -ForegroundColor Green
@@ -377,7 +379,11 @@ if ($Capture) {
         }
     }
     else {
-        Write-Host '  No CTL fetch to ctldl logged during the bind (cached, or not the cause).' -ForegroundColor Green
+        Write-Host '  No CTL fetch to ctldl logged during the bind.' -ForegroundColor Green
+        Write-Host '  => The CTL was cached, OR (common with an internal PKI) this DC''s cert' -ForegroundColor Green
+        Write-Host '     chains to a locally-trusted root, so validation needs no ctldl fetch and' -ForegroundColor Green
+        Write-Host '     stays fast even while ctldl is blocked. The CTL engine is not this DC''s' -ForegroundColor Green
+        Write-Host '     delay; a slow DC''s cert triggers a fetch (untrusted root) or revocation.' -ForegroundColor Green
     }
 
     # Restore CAPI2 state.
