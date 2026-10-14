@@ -1,0 +1,24 @@
+# Diagnostic captures and outputs - these may contain customer data
+# (hostnames, IPs, certificates, traces). NEVER commit them.
+*.etl
+*.evtx
+*.cab
+*.html
+*.htm
+*.csv
+*.tsv
+*.pdf
+*.cer
+*.crt
+*.pfx
+*.p12
+*.key
+*.log
+ConnTrace_*
+dccert.cer
+certutil-*.log
+
+# Scratch / temp
+*.tmp
+*.bak
+~$*
