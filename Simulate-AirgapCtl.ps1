@@ -1,50 +1,46 @@
 <#
 .SYNOPSIS
     Reproduces, in a lab and reversibly, the isolated-network CTL-fetch timeout -
-    the classic cause of slow first LDAPS binds - by blocking the client's
-    outbound HTTP(S), then runs Test-LdapsCtl -Capture and restores.
+    the classic cause of slow first LDAPS binds - by blocking the client's path
+    to ctldl.windowsupdate.com, then runs Test-LdapsCtl -Capture and restores.
 
 .DESCRIPTION
     During the TLS handshake the client (via CryptSvc/WinHTTP) fetches the
     Certificate Trust List from ctldl.windowsupdate.com over HTTP. On an isolated
-    network those packets are silently dropped, so WinHTTP waits out its ~15 s
-    timeout, then caches - the slow first bind.
+    network those packets are silently dropped, so WinHTTP waits out its timeout,
+    then caches - the slow first bind.
 
-    To reproduce the *hang* (not a fast failure) the traffic must be silently
-    dropped. This adds a Windows Firewall rule that BLOCKS outbound TCP 80 and
-    443 (silent drop = the real hang). That is enough and clean because:
-      - the CTL fetch and HTTP CDP/OCSP go over 80/443 -> blocked -> they hang;
-      - Kerberos (88), LDAP/LDAPS (389/636), SMB (445) and DNS (53) are NOT on
-        80/443, so the DC stays reachable and the bind itself still works.
+    To reproduce the hang the traffic must be silently dropped. This adds two
+    Windows Firewall rules (silent drop):
+      - outbound TCP 80/443 (the web ports the CTL/CDP fetch uses), and
+      - outbound to ctldl's currently resolved IPs and their /24 (covers CDN
+        rotation and any non-80/443 case).
+    Kerberos (88), LDAP/LDAPS (389/636), SMB (445) and DNS (53) are untouched, so
+    the DC stays reachable and the bind itself still works.
 
-    This replaces an earlier hosts-file approach: redirecting a windowsupdate.com
-    name in the hosts file is the malware signature SettingsModifier:
-    Win32/HostsFileHijack and Microsoft Defender blocks it. A firewall rule is
-    not flagged, needs no IP list (CDN IPs rotate), and is cleanly reversible.
+    It waits for the rules to propagate and VERIFIES the block actually took
+    before running the diagnostic - if some endpoint-protection/proxy layer
+    filters outbound traffic ahead of the Windows firewall, the rule has no
+    effect and the script says so instead of producing a misleading result. In
+    that case reproduce on an isolated VM (internal vSwitch to the DC, no internet
+    route) or on-site, where the air gap is real.
 
-    The firewall rule is removed in a finally block, so an error or Ctrl-C still
-    restores connectivity. -Restore removes a rule left by -KeepBlocked.
+    Rules are removed in a finally block; -Restore removes a kept block.
 
-    IMPORTANT: for the few seconds of the test this client cannot reach any
-    HTTP/HTTPS site. Run it on a LAB client, not a production box, and only where
-    the DC and DNS are reachable without the internet (same subnet).
+    IMPORTANT: for the duration of the test this client cannot reach the blocked
+    hosts/ports. Lab use only; the DC and DNS must be reachable without internet.
 
 .PARAMETER DC
     Domain controller to run the LDAPS diagnostic against (FQDN recommended).
 
 .PARAMETER KeepBlocked
-    Leave the block in place after the run (for manual testing). Remove it later
-    with -Restore.
+    Leave the block in place after the run. Remove it later with -Restore.
 
 .PARAMETER Restore
     Only remove a block left by a previous -KeepBlocked run, then exit.
 
 .EXAMPLE
     .\Simulate-AirgapCtl.ps1 -DC dc01.example.com
-
-.EXAMPLE
-    .\Simulate-AirgapCtl.ps1 -DC dc01.example.com -KeepBlocked
-    .\Simulate-AirgapCtl.ps1 -Restore
 
 .NOTES
     AZITC - Alexander Zarenko IT Consulting
@@ -73,17 +69,9 @@ if (-not $isAdmin) {
 }
 
 function Remove-Block {
-    try { Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue } catch { }
-}
-
-function Add-Block {
-    Remove-Block
-    # Silent drop of outbound web, so the CTL/CDP fetch hangs in its timeout.
-    New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Action Block `
-        -Protocol TCP -RemotePort 80,443 -Profile Any -ErrorAction Stop | Out-Null
-    & ipconfig /flushdns *> $null
-    & certutil -urlcache ctl delete *> $null
-    & certutil -urlcache crl delete *> $null
+    foreach ($n in $ruleName, "$ruleName-ip") {
+        try { Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue } catch { }
+    }
 }
 
 function Test-Tcp($Server, $Port, $TimeoutMs) {
@@ -95,12 +83,37 @@ function Test-Tcp($Server, $Port, $TimeoutMs) {
     } catch { $false } finally { $c.Close() }
 }
 
+function Add-Block {
+    Remove-Block
+
+    # Resolve ctldl first (DNS = port 53, not blocked), then block its IPs + /24.
+    $ips = @()
+    try { $ips = @([Net.Dns]::GetHostAddresses($ctlHost) |
+                   Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                   ForEach-Object { $_.IPAddressToString }) } catch { }
+    $nets = @($ips | ForEach-Object { $_ -replace '\.\d+$', '.0/24' } | Select-Object -Unique)
+
+    New-NetFirewallRule -DisplayName $ruleName -Direction Outbound -Action Block `
+        -Protocol TCP -RemotePort 80,443 -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    if ($nets.Count -gt 0) {
+        New-NetFirewallRule -DisplayName "$ruleName-ip" -Direction Outbound -Action Block `
+            -RemoteAddress $nets -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    Start-Sleep -Seconds 2                      # let the rules propagate
+    & ipconfig /flushdns *> $null
+    & certutil -urlcache ctl delete *> $null
+    & certutil -urlcache crl delete *> $null
+
+    return ,$nets
+}
+
 # ---------------------------------------------------------------------
-# -Restore: just tear down a previously kept block
+# -Restore
 # ---------------------------------------------------------------------
 if ($Restore) {
     Write-Host ''
-    Write-Host 'Removing any AZITC air-gap simulation firewall rule...' -ForegroundColor Cyan
+    Write-Host 'Removing any AZITC air-gap simulation firewall rules...' -ForegroundColor Cyan
     Remove-Block
     Write-Host '  Done.' -ForegroundColor Green
     Write-Host ''
@@ -114,42 +127,56 @@ if (-not $DC) {
 
 Write-Host ''
 Write-Host '=============================================================' -ForegroundColor Magenta
-Write-Host ' Air-gap CTL simulation  (LAB ONLY - blocks outbound 80/443)' -ForegroundColor Magenta
+Write-Host ' Air-gap CTL simulation  (LAB ONLY - blocks ctldl path)' -ForegroundColor Magenta
 Write-Host '=============================================================' -ForegroundColor Magenta
 
 try {
-    Add-Block
-    Write-Host '  Outbound TCP 80/443 blocked (silent drop).' -ForegroundColor Cyan
+    $nets = Add-Block
+    Write-Host ('  Blocked: outbound TCP 80/443 + ctldl nets [{0}]' -f ($nets -join ', ')) -ForegroundColor Cyan
 
-    # Confirm the CTL path is now dead.
-    $reachable = Test-Tcp $ctlHost 80 3000
-    Write-Host ('  {0} reachable now? {1}' -f $ctlHost, $(if ($reachable) { 'YES - block did not take, check the firewall' } else { 'no (blocked as intended)' })) `
-        -ForegroundColor $(if ($reachable) { 'Red' } else { 'Green' })
+    # Verify the block actually took (try both 80 and 443).
+    $r80  = Test-Tcp $ctlHost 80  3000
+    $r443 = Test-Tcp $ctlHost 443 3000
+    $blocked = (-not $r80) -and (-not $r443)
+    Write-Host ('  {0} reachable now? 80={1} 443={2}' -f $ctlHost,
+        $(if ($r80) { 'YES' } else { 'no' }), $(if ($r443) { 'YES' } else { 'no' })) `
+        -ForegroundColor $(if ($blocked) { 'Green' } else { 'Red' })
     Write-Host ''
+
+    if (-not $blocked) {
+        Write-Host '  => The block did NOT take although the Windows firewall is on and the' -ForegroundColor Red
+        Write-Host '     rules were created. An endpoint-protection/EDR or proxy layer is' -ForegroundColor Red
+        Write-Host '     filtering outbound traffic ahead of the Windows firewall. The red' -ForegroundColor Red
+        Write-Host '     path cannot be simulated on this client - use an isolated VM' -ForegroundColor Red
+        Write-Host '     (internal vSwitch to the DC, no internet route) or validate on-site.' -ForegroundColor Red
+        return
+    }
 
     $ctlScript = Join-Path $PSScriptRoot 'Test-LdapsCtl.ps1'
     if (Test-Path $ctlScript) {
-        Write-Host 'Running Test-LdapsCtl -Capture under the simulated air gap...' -ForegroundColor Cyan
-        Write-Host '(expect: section B unreachable, section D cold bind in seconds + CAPI2 Event 53)' -ForegroundColor DarkGray
+        Write-Host 'ctldl is now unreachable. Running Test-LdapsCtl -Capture...' -ForegroundColor Cyan
+        Write-Host '(expect: section B unreachable, section D cold bind slow + CAPI2 Event 53)' -ForegroundColor DarkGray
         & $ctlScript -DC $DC -Capture
     }
     else {
         Write-Host ('Test-LdapsCtl.ps1 not found next to this script ({0}).' -f $PSScriptRoot) -ForegroundColor Yellow
-        Write-Host 'The block is in place - run your LDAPS measurement now, then re-run with -Restore.' -ForegroundColor Yellow
+        Write-Host 'The block is in place - run your LDAPS measurement now, then -Restore.' -ForegroundColor Yellow
         $KeepBlocked = $true
     }
 }
 finally {
     if ($KeepBlocked) {
         Write-Host ''
-        Write-Host ('Block LEFT IN PLACE (-KeepBlocked). Undo later with:  .\{0} -Restore' -f (Split-Path $PSCommandPath -Leaf)) -ForegroundColor Yellow
+        Write-Host ('Block LEFT IN PLACE (-KeepBlocked). Undo with:  .\{0} -Restore' -f (Split-Path $PSCommandPath -Leaf)) -ForegroundColor Yellow
     }
     else {
         Write-Host ''
-        Write-Host 'Removing the firewall rule...' -ForegroundColor Cyan
+        Write-Host 'Removing the firewall rules...' -ForegroundColor Cyan
         Remove-Block
+        Start-Sleep -Seconds 1
         $still = Test-Tcp $ctlHost 80 3000
-        Write-Host ('  {0} reachable again? {1}' -f $ctlHost, $(if ($still) { 'yes - restored' } else { 'NO - remove rule "' + $ruleName + '" manually!' })) `
+        Write-Host ('  {0} reachable again? {1}' -f $ctlHost,
+            $(if ($still) { 'yes - restored' } else { 'NO - remove rules "' + $ruleName + '*" manually!' })) `
             -ForegroundColor $(if ($still) { 'Green' } else { 'Red' })
     }
     Write-Host ''
