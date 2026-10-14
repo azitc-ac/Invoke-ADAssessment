@@ -50,6 +50,30 @@ The compliance thresholds follow the **CIS Benchmark** as a practical baseline. 
 
 This tool doesn't try to match those in breadth — it deliberately covers a focused, fully editable core with a sourced compliance view. For a real assessment, combine it: **Purple Knight** for the security score, **ADxRay** for broad inventory, this script as the editable bracket around them.
 
+## Companion diagnostics
+
+Alongside the main assessment, the repo carries focused scripts for two problems that come up constantly on real DCs — **slow LDAP/LDAPS binds** and **slow SMB/CIFS access**. Each is a single, PowerShell 5.1 script with a compact, colour-coded verdict. All are read-only except `Simulate-AirgapCtl.ps1`, which is clearly marked.
+
+**LDAP / LDAPS bind performance & root cause**
+
+- `Test-LdapsBind.ps1` — LDAP (389) vs LDAPS (636) bind time per DC. A fast LDAP with a slow LDAPS bind is the classic signature of a TLS / certificate-validation delay rather than a slow DC.
+- `Get-LdapBindMetric.ps1` — a slim single-DC variant returning `{ DC, LDAP, LDAPS }` (object or `-Json`) for monitoring, e.g. a Zabbix master item with JSONPath dependent items.
+- `Test-LdapsRevocation.ps1` — checks the DC's LDAPS certificate chain and parses the per-URL CDP/AIA/OCSP fetch time, so a slow or failing revocation URL becomes visible.
+- `Test-LdapsCtl.ps1` — the other validation path: the CTL (AuthRoot auto-update) engine, which fetches from `ctldl.windowsupdate.com` during the handshake and, on an isolated network, times out. Checks policy, reachability, cache, and (`-Capture`, admin) a CAPI2-correlated cold bind; a raw TLS probe reports the exact SChannel error when a bind fails.
+- `Simulate-AirgapCtl.ps1` — **not read-only; lab use only.** Reversibly reproduces that isolated-network CTL timeout (hosts pin + firewall drop), clears the caches, runs the diagnostic, and restores everything in a `finally` block (`-Restore` cleans up a kept block).
+
+**SMB / CIFS connection setup**
+
+- `Test-SmbConnectSetup.ps1` — cold vs warm SMB connect per server, and whether Kerberos or a silent NTLM fallback was used. Explains "it works but the first access is slow" and why no CIFS service ticket is raised.
+- `Invoke-ConnTrace.ps1` — captures a scoped ETW trace (SMBClient / Kerberos / NTLM / DNS) around a connect, or analyses an existing `.etl`/`.evtx` offline, and produces a per-target verdict (Kerberos vs NTLM, DNS health, the largest inter-event gap) plus a self-contained HTML timeline. No internet, no extra tools.
+
+**Domain controller health**
+
+- `Get-DcMemoryPressure.ps1` — the counters that actually indicate memory pressure (Available MBytes, commit charge, Pages/sec, LSASS trend), because "free RAM" is meaningless when LSASS caches the database.
+- `Get-DnsStaleRecords.ps1` — lists DNS records by timestamp age to show what scavenging would delete *before* you enable it, surfacing the risk group: live hosts with a stale timestamp that nothing refreshes.
+
+> These touch certificates, Kerberos and SMB on live DCs. Reading them can look like attacker enumeration to a SIEM — give the SOC/EDR team a heads-up, as with the main assessment.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
