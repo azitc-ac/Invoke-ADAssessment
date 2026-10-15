@@ -36,16 +36,19 @@
     arguments here.
 
 .PARAMETER Segments
-    One or more segments to test, each a hashtable with:
-      Name          - required. Used as -SegmentName and as the result
-                      file's name (sanitised for the filesystem).
-      ComputerName  - required. A host inside that segment, reachable via
-                      PowerShell remoting from here.
-      Credential    - optional. A PSCredential for that host. Falls back to
-                      -Credential, then the current identity.
-    Example:
-      @{ Name = 'HQ'; ComputerName = 'jump-hq' },
-      @{ Name = 'Branch-VLAN20'; ComputerName = 'jump-branch.contoso.com' }
+    One or more segments to test. Each entry is either:
+      - a plain string: the host's name, used as both -SegmentName and
+        -ComputerName (the common case - remoting into a handful of named
+        hosts with no separate "segment label" or per-host credential).
+      - a hashtable: { Name (required), ComputerName (required),
+        Credential (optional, falls back to -Credential then the current
+        identity) } - use this when the human-readable segment label
+        should differ from the host you remote into, or a given host needs
+        its own credential.
+    The two forms can be mixed in the same array.
+    Examples:
+      -Segments dc6,dc7
+      -Segments @{ Name = 'HQ'; ComputerName = 'jump-hq' }, @{ Name = 'Branch-VLAN20'; ComputerName = 'jump-branch.contoso.com' }
 
 .PARAMETER Target
     Targets passed straight through to Test-AdPortMatrix.ps1 on every
@@ -83,6 +86,11 @@
     comparison, once two or more results are present.
 
 .EXAMPLE
+    # Simple case: remote into dc6 and dc7 by name, no separate segment label.
+    .\Invoke-SegmentProbeFanOut.ps1 -Segments dc6,dc7 -Target dc6,dc7 -HtmlReport segment-diff.html
+
+.EXAMPLE
+    # Segment label differs from the host remoted into, and/or needs its own credential.
     $segments = @(
         @{ Name = 'HQ';           ComputerName = 'jump-hq' },
         @{ Name = 'Branch-VLAN20'; ComputerName = 'jump-branch.contoso.com' }
@@ -108,7 +116,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [hashtable[]] $Segments,
+    [object[]] $Segments,
 
     [Parameter(Mandatory = $true)]
     [string[]] $Target,
@@ -162,7 +170,18 @@ Write-Host ''
 
 $outcomes = New-Object System.Collections.ArrayList
 
-foreach ($seg in $Segments) {
+foreach ($rawSeg in $Segments) {
+
+    if ($rawSeg -is [string]) {
+        $seg = @{ Name = $rawSeg; ComputerName = $rawSeg }
+    }
+    elseif ($rawSeg -is [hashtable]) {
+        $seg = $rawSeg
+    }
+    else {
+        Write-Host ('Skipping unsupported -Segments entry (expected a host name or a hashtable): {0}' -f $rawSeg) -ForegroundColor Red
+        continue
+    }
 
     if (-not $seg.Name -or -not $seg.ComputerName) {
         Write-Host ('Skipping a -Segments entry missing Name or ComputerName: {0}' -f ($seg | Out-String)) -ForegroundColor Red
