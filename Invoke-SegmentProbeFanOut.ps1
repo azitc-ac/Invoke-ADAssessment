@@ -66,8 +66,21 @@
 .PARAMETER ProbeMs
     Passed straight through to Test-AdPortMatrix.ps1 on every segment.
 
+.PARAMETER UdpRepeat
+    Passed straight through to Test-AdPortMatrix.ps1 on every segment.
+
 .PARAMETER RpcSampleCount
     Passed straight through to Test-AdPortMatrix.ps1 on every segment.
+
+.PARAMETER NoListenerCheck
+    Skip the listener inventory. By default, after the segment probes, this
+    script remotes into each -Target itself (same -Credential) and records
+    which TCP ports are in LISTEN state and which UDP ports have a bound
+    endpoint there. Compare-SegmentProbes.ps1 then shows, per row, whether
+    anything is listening on the target at all - which is what separates
+    "nothing to reach" (a host/role question, not a network one) from "not
+    reachable from this segment". A target that cannot be remoted into is
+    simply reported as unknown; the comparison still runs.
 
 .PARAMETER ResultsFolder
     Where each segment's JSON is collected, and where you can manually drop
@@ -124,11 +137,14 @@ param(
     [pscredential] $Credential,
 
     [int] $ProbeMs = 2000,
+    [int] $UdpRepeat = 3,
     [int] $RpcSampleCount = 10,
 
     [string] $ResultsFolder,
 
     [switch] $SkipExisting,
+
+    [switch] $NoListenerCheck,
 
     [string] $HtmlReport
 )
@@ -212,6 +228,7 @@ foreach ($rawSeg in $Segments) {
         Target         = $Target
         SegmentName    = $seg.Name
         ProbeMs        = $ProbeMs
+        UdpRepeat      = $UdpRepeat
         RpcSampleCount = $RpcSampleCount
         Json           = $true
     }
@@ -256,7 +273,48 @@ foreach ($o in $outcomes) {
 }
 Write-Host ''
 
-$allResultFiles = @(Get-ChildItem -Path $ResultsFolder -Filter '*.json' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+# ---------------------------------------------------------------------
+# Listener inventory on the targets themselves. "Is anything bound to this
+# port on the DC" is a property of the target, not of the segment probing
+# it, so it is collected once from here, not per segment. Failure to reach
+# a target is recorded as unknown and never blocks the comparison.
+# ---------------------------------------------------------------------
+$listenerFile = Join-Path $ResultsFolder '_listeners.json'
+if (-not $NoListenerCheck) {
+    Write-Host 'Collecting listener inventory on the targets ...' -ForegroundColor Cyan
+    $listenerTargets = New-Object System.Collections.ArrayList
+    foreach ($t in $Target) {
+        $icParams = @{ ComputerName = $t; ErrorAction = 'Stop' }
+        if ($Credential) { $icParams.Credential = $Credential }
+        try {
+            $inv = Invoke-Command @icParams -ScriptBlock {
+                $tcp = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Select-Object -ExpandProperty LocalPort | Sort-Object -Unique)
+                $udp = @(Get-NetUDPEndpoint -ErrorAction Stop | Select-Object -ExpandProperty LocalPort | Sort-Object -Unique)
+                [pscustomobject]@{ Computer = $env:COMPUTERNAME; Tcp = $tcp; Udp = $udp }
+            }
+            [void]$listenerTargets.Add([pscustomobject]@{
+                Target   = $t
+                Status   = 'OK'
+                Computer = $inv.Computer
+                Tcp      = @($inv.Tcp | ForEach-Object { [int]$_ })
+                Udp      = @($inv.Udp | ForEach-Object { [int]$_ })
+            })
+            Write-Host ('  {0}: {1} TCP listeners, {2} UDP endpoints' -f $t, @($inv.Tcp).Count, @($inv.Udp).Count) -ForegroundColor Green
+        }
+        catch {
+            [void]$listenerTargets.Add([pscustomobject]@{ Target = $t; Status = ('Failed: ' + $_.Exception.Message); Computer = $null; Tcp = @(); Udp = @() })
+            Write-Host ('  {0}: listener inventory unavailable ({1}) - rows for this target will show listener = unknown' -f $t, $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+    [pscustomobject]@{ Timestamp = (Get-Date).ToString('o'); Targets = $listenerTargets } |
+        ConvertTo-Json -Depth 5 | Set-Content -Path $listenerFile -Encoding UTF8
+    Write-Host ''
+}
+
+# Segment results only - the listener inventory (and anything else starting
+# with an underscore) is not a probe file.
+$allResultFiles = @(Get-ChildItem -Path $ResultsFolder -Filter '*.json' -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -notlike '_*' } | Select-Object -ExpandProperty FullName)
 
 if ($allResultFiles.Count -lt 2) {
     Write-Host ('Only {0} result file(s) in {1} - need at least 2 to compare.' -f $allResultFiles.Count, $ResultsFolder) -ForegroundColor Yellow
@@ -269,5 +327,6 @@ Write-Host ''
 
 $compareParams = @{ InputFile = $allResultFiles }
 if ($HtmlReport) { $compareParams.HtmlReport = $HtmlReport }
+if (Test-Path $listenerFile) { $compareParams.ListenerFile = $listenerFile }
 
 & $comparePath @compareParams

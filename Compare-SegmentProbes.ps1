@@ -24,6 +24,16 @@
     the customer, with every result (not just the differences) so they can
     see what was actually tested.
 
+.PARAMETER ListenerFile
+    The _listeners.json written by Invoke-SegmentProbeFanOut.ps1: which TCP
+    ports are in LISTEN state and which UDP ports have a bound endpoint on
+    each target. Adds a "Listener" column so a "No response" row can be read
+    correctly: NOT listening means there was nothing to reach - a host/role
+    question, not a network finding - while a listener that still gets no
+    reply from a segment is the real suspect. Rows for targets the inventory
+    could not reach show "unknown". Optional; without it the column is
+    omitted.
+
 .EXAMPLE
     .\Compare-SegmentProbes.ps1 -InputFile hq-probe.json,branch-probe.json
 
@@ -39,7 +49,9 @@ param(
     [Parameter(Mandatory = $true)]
     [string[]] $InputFile,
 
-    [string] $HtmlReport
+    [string] $HtmlReport,
+
+    [string] $ListenerFile
 )
 
 if (@($InputFile).Count -lt 2) {
@@ -80,6 +92,45 @@ if (@($segmentNames | Select-Object -Unique).Count -ne $segmentNames.Count) {
     return
 }
 
+# Optional listener inventory (target -> what is bound there)
+$listeners = @{}
+$haveListeners = $false
+if ($ListenerFile) {
+    if (-not (Test-Path $ListenerFile)) {
+        Write-Host ('Listener file not found, continuing without it: {0}' -f $ListenerFile) -ForegroundColor Yellow
+    }
+    else {
+        try {
+            $lf = Get-Content -Path $ListenerFile -Raw | ConvertFrom-Json
+            foreach ($lt in @($lf.Targets)) {
+                $listeners[[string]$lt.Target] = [pscustomobject]@{
+                    Status = [string]$lt.Status
+                    Tcp    = @($lt.Tcp | ForEach-Object { [int]$_ })
+                    Udp    = @($lt.Udp | ForEach-Object { [int]$_ })
+                }
+            }
+            $haveListeners = $true
+        }
+        catch {
+            Write-Host ('Could not parse listener file, continuing without it: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+        }
+    }
+}
+
+# listening / NOT listening / unknown, or '-' for rows that have no fixed port
+function Get-ListenerState {
+    param($Row)
+    if (-not $haveListeners) { return '' }
+    if ($Row.Proto -ne 'TCP' -and $Row.Proto -ne 'UDP') { return '-' }
+    $port = 0
+    if (-not [int]::TryParse([string]$Row.Port, [ref]$port)) { return '-' }
+    $l = $listeners[[string]$Row.Target]
+    if (-not $l -or $l.Status -ne 'OK') { return 'unknown' }
+    $bound = if ($Row.Proto -eq 'TCP') { $l.Tcp } else { $l.Udp }
+    if ($bound -contains $port) { return 'listening' }
+    return 'NOT listening'
+}
+
 Write-Host ''
 Write-Host ('Comparing {0} segment probes:' -f $runs.Count) -ForegroundColor Cyan
 foreach ($r in $runs) { Write-Host ('  - {0} (captured {1})' -f $r.SegmentName, $r.Timestamp) -ForegroundColor Cyan }
@@ -95,14 +146,19 @@ foreach ($run in $runs) {
             $key = '{0}|{1}|{2}' -f $t.Target, $p.Port, $p.Proto
             if (-not $matrix.ContainsKey($key)) {
                 $matrix[$key] = [pscustomobject]@{
-                    Target = $t.Target
-                    Port   = $p.Port
-                    Proto  = $p.Proto
-                    Name   = $p.Name
-                    States = [ordered]@{}
+                    Target  = $t.Target
+                    Port    = $p.Port
+                    Proto   = $p.Proto
+                    Name    = $p.Name
+                    States  = [ordered]@{}
+                    Details = [ordered]@{}
                 }
             }
             $matrix[$key].States[$run.SegmentName] = $p.State
+            # Detail (reply ratio etc.) exists in newer probe files only
+            $d = ''
+            if ($p.PSObject.Properties['Detail'] -and $p.Detail) { $d = [string]$p.Detail }
+            $matrix[$key].Details[$run.SegmentName] = $d
         }
         # Dynamic RPC ports (TCP). Deterministic per run, so they diff too - the
         # classic "segments connected but the RPC range is blocked" case.
@@ -110,11 +166,12 @@ foreach ($run in $runs) {
             $key = '{0}|{1}|{2}' -f $t.Target, $rp.Port, 'TCP'
             if (-not $matrix.ContainsKey($key)) {
                 $matrix[$key] = [pscustomobject]@{
-                    Target = $t.Target
-                    Port   = $rp.Port
-                    Proto  = 'TCP'
-                    Name   = 'RPC dynamic'
-                    States = [ordered]@{}
+                    Target  = $t.Target
+                    Port    = $rp.Port
+                    Proto   = 'TCP'
+                    Name    = 'RPC dynamic'
+                    States  = [ordered]@{}
+                    Details = [ordered]@{}
                 }
             }
             $matrix[$key].States[$run.SegmentName] = $rp.State
@@ -126,14 +183,16 @@ foreach ($run in $runs) {
             $key = '{0}|dynamic|RPC' -f $t.Target
             if (-not $matrix.ContainsKey($key)) {
                 $matrix[$key] = [pscustomobject]@{
-                    Target = $t.Target
-                    Port   = 'dynamic'
-                    Proto  = 'RPC'
-                    Name   = 'RPC dynamic (DCOM reach)'
-                    States = [ordered]@{}
+                    Target  = $t.Target
+                    Port    = 'dynamic'
+                    Proto   = 'RPC'
+                    Name    = 'RPC dynamic (DCOM reach)'
+                    States  = [ordered]@{}
+                    Details = [ordered]@{}
                 }
             }
             $matrix[$key].States[$run.SegmentName] = $t.RpcReach
+            if ($t.RpcDetail) { $matrix[$key].Details[$run.SegmentName] = [string]$t.RpcDetail }
         }
     }
 }
@@ -156,18 +215,43 @@ else {
     Write-Host ('{0} of {1} target/port combination(s) behave differently depending on the segment:' -f $diffRows.Count, $rows.Count) -ForegroundColor Red
     Write-Host ''
     foreach ($row in ($diffRows | Sort-Object Target, Port)) {
-        Write-Host ('  {0}   port {1}/{2}   ({3})' -f $row.Target, $row.Port, $row.Proto, $row.Name) -ForegroundColor Yellow
+        $lstate = Get-ListenerState $row
+        $ltxt = ''
+        if ($lstate -and $lstate -ne '-') { $ltxt = '   [target: {0}]' -f $lstate }
+        Write-Host ('  {0}   port {1}/{2}   ({3}){4}' -f $row.Target, $row.Port, $row.Proto, $row.Name, $ltxt) -ForegroundColor Yellow
         foreach ($seg in $segmentNames) {
             $state = $row.States[$seg]
             if (-not $state) { $state = '(not tested)' }
+            $detail = $row.Details[$seg]
+            $cell = $state
+            if ($detail) { $cell = '{0}  ({1})' -f $state, $detail }
             $colour = 'DarkYellow'
             if ($state -match 'Open|Responded|\bReachable') { $colour = 'Green' }
-            elseif ($state -match 'Closed|Filtered|Unreachable') { $colour = 'Red' }
-            Write-Host ('      {0,-32} {1}' -f $seg, $state) -ForegroundColor $colour
+            elseif ($state -match 'Closed|Filtered|Unreachable|^Error') { $colour = 'Red' }
+            elseif ($state -eq 'Not probed') { $colour = 'DarkGray' }
+            Write-Host ('      {0,-32} {1}' -f $seg, $cell) -ForegroundColor $colour
         }
     }
 }
 Write-Host ''
+
+# Rows where the target has nothing bound to the port: whatever the segments
+# saw there is not a network finding, so call it out separately.
+if ($haveListeners) {
+    $noListen = @($rows | Where-Object { (Get-ListenerState $_) -eq 'NOT listening' })
+    $unknownListen = @($rows | Where-Object { (Get-ListenerState $_) -eq 'unknown' } | Select-Object -ExpandProperty Target -Unique)
+    if ($noListen.Count -gt 0) {
+        Write-Host ('{0} port(s) have NO listener on the target - any "No response" there is a host/role question, not a network one:' -f $noListen.Count) -ForegroundColor Yellow
+        foreach ($row in ($noListen | Sort-Object Target, Port)) {
+            Write-Host ('  {0}   port {1}/{2}   ({3})' -f $row.Target, $row.Port, $row.Proto, $row.Name) -ForegroundColor Yellow
+        }
+        Write-Host ''
+    }
+    if ($unknownListen.Count -gt 0) {
+        Write-Host ('Listener inventory unavailable for: {0} - their rows show listener = unknown.' -f ($unknownListen -join ', ')) -ForegroundColor DarkGray
+        Write-Host ''
+    }
+}
 
 # ---------------------------------------------------------------------
 # Optional HTML report
@@ -184,6 +268,10 @@ if ($HtmlReport) {
     [void]$sb.Append("td.open{background:#d4efdf;color:#186a3b;}")
     [void]$sb.Append("td.closed{background:#f5b7b1;color:#922b21;}")
     [void]$sb.Append("td.unclear{background:#fcf3cf;color:#7d6608;}")
+    [void]$sb.Append("td.skipped{background:#eee;color:#777;}")
+    [void]$sb.Append("td.nolisten{background:#fde9c9;color:#8a4b00;font-weight:bold;}")
+    [void]$sb.Append("td.listen{color:#186a3b;}")
+    [void]$sb.Append("span.detail{display:block;font-size:11px;font-weight:normal;color:#555;}")
     [void]$sb.Append(".meta{color:#666;font-size:12px;}")
     [void]$sb.Append("</style></head><body>")
     [void]$sb.Append('<h1>Segment probe comparison</h1>')
@@ -196,8 +284,13 @@ if ($HtmlReport) {
     [void]$sb.Append('</ul>')
 
     [void]$sb.Append('<p>' + $rows.Count + ' target/port combination(s) tested, <strong>' + $diffRows.Count + ' differ</strong> across segments. Rows that differ are bold and listed first.</p>')
+    if ($haveListeners) {
+        [void]$sb.Append('<p>The <strong>Listener</strong> column is what is actually bound on the target itself (collected there, not from a segment). <strong>NOT listening</strong> means there was nothing to reach - a host/role question, not a network finding. A listener that still gets no reply from a segment is the real suspect.</p>')
+    }
+    [void]$sb.Append('<p class="meta">UDP rows send a real protocol request (DNS query, NTP request, CLDAP search) several times; the detail under each state is the reply ratio. "No response" on its own is never a firewall verdict. Kerberos/kpasswd over UDP are listed but not probed - Windows clients use TCP there.</p>')
 
     [void]$sb.Append('<table><tr><th>Target</th><th>Port</th><th>Proto</th><th>Service</th>')
+    if ($haveListeners) { [void]$sb.Append('<th>Listener</th>') }
     foreach ($seg in $segmentNames) { [void]$sb.Append('<th>' + (ConvertTo-HtmlEncoded $seg) + '</th>') }
     [void]$sb.Append('</tr>')
 
@@ -207,13 +300,24 @@ if ($HtmlReport) {
         $isDiff = $diffRows -contains $row
         $rowClass = if ($isDiff) { " class='diff'" } else { '' }
         [void]$sb.Append("<tr$rowClass><td>" + (ConvertTo-HtmlEncoded $row.Target) + '</td><td>' + $row.Port + '</td><td>' + (ConvertTo-HtmlEncoded $row.Proto) + '</td><td>' + (ConvertTo-HtmlEncoded $row.Name) + '</td>')
+        if ($haveListeners) {
+            $lstate = Get-ListenerState $row
+            $lcls = ''
+            if ($lstate -eq 'NOT listening') { $lcls = " class='nolisten'" }
+            elseif ($lstate -eq 'listening') { $lcls = " class='listen'" }
+            [void]$sb.Append("<td$lcls>" + (ConvertTo-HtmlEncoded $lstate) + '</td>')
+        }
         foreach ($seg in $segmentNames) {
             $state = $row.States[$seg]
             if (-not $state) { $state = '(not tested)' }
             $cls = 'unclear'
             if ($state -match 'Open|Responded|\bReachable') { $cls = 'open' }
-            elseif ($state -match 'Closed|Filtered|Unreachable') { $cls = 'closed' }
-            [void]$sb.Append("<td class='$cls'>" + (ConvertTo-HtmlEncoded $state) + '</td>')
+            elseif ($state -match 'Closed|Filtered|Unreachable|^Error') { $cls = 'closed' }
+            elseif ($state -eq 'Not probed') { $cls = 'skipped' }
+            $cell = ConvertTo-HtmlEncoded $state
+            $detail = $row.Details[$seg]
+            if ($detail) { $cell += "<span class='detail'>" + (ConvertTo-HtmlEncoded $detail) + '</span>' }
+            [void]$sb.Append("<td class='$cls'>" + $cell + '</td>')
         }
         [void]$sb.Append('</tr>')
     }

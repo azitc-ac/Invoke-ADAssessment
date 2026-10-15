@@ -12,13 +12,41 @@
 
     Tests the fixed well-known AD ports (DNS, Kerberos, RPC endpoint mapper,
     LDAP/LDAPS, SMB, kpasswd, Global Catalog, NTP, AD Web Services) via TCP
-    and, where the protocol uses it, UDP. UDP results are inherently weaker
-    evidence than TCP: a probe can tell "got a reply" and "got an ICMP
-    port-unreachable" (closed) apart, but a plain timeout is ambiguous - it
-    means either the port is open and the service ignored an unsolicited
-    packet, or a firewall silently dropped it. That ambiguous case is always
-    reported as "No response (UDP, inconclusive)", never as a confident pass
-    or fail.
+    and, where the protocol actually uses it, UDP.
+
+    TCP vs UDP - which transport AD really uses per port, and what that
+    means for the probe:
+      53   DNS        UDP for every lookup; TCP when a reply is truncated
+                      (large SRV sets) and for zone transfers. Both matter.
+      88   Kerberos   Windows clients use TCP by default since Vista/2008
+                      (MaxPacketSize); UDP only matters for legacy and
+                      non-Windows clients.
+      464  kpasswd    Same as Kerberos.
+      123  NTP        UDP only.
+      389  LDAP       TCP for every directory operation. UDP = CLDAP, used
+                      solely for the DC-locator "ping" - small but critical
+                      (slow logons / wrong DC when it is blocked).
+      135, dynamic RPC, 445 SMB, 636/3268/3269, 9389: TCP only.
+
+    A UDP port cannot be "connected" to; the only evidence is a reply, and a
+    service only replies to a packet it recognises. So the UDP probes send a
+    VALID minimal request for that protocol - a real DNS query (RD=0, root
+    NS), a real NTP client request, a real CLDAP RootDSE search - never a
+    dummy payload, and repeat it -UdpRepeat times so packet loss shows up as
+    a ratio ("2/3 replies") instead of flipping the verdict between runs.
+    Kerberos and kpasswd over UDP are NOT probed: there is no cheap valid
+    request for them, and for Windows clients the TCP row is the relevant
+    one. Those rows stay visible as "Not probed" so nothing is missing
+    unexplained.
+
+    Even a valid request can go unanswered for more than one reason: nothing
+    bound to the port on the target, a firewall dropping it, or plain loss.
+    A Windows target almost never sends ICMP port-unreachable (rate-limited
+    and usually filtered), so "Closed" is rarely observable for UDP. "No
+    response" is therefore never phrased as a firewall verdict. What settles
+    "nothing listening" vs "not reachable from here" is the listener
+    inventory Invoke-SegmentProbeFanOut.ps1 collects on the targets
+    themselves and feeds into Compare-SegmentProbes.ps1.
 
     For the RPC dynamic port range used by AD replication (the classic
     "segments are mostly connected but the port range is blocked" failure),
@@ -69,6 +97,12 @@
     higher-latency WAN link between segments - raise this if that check
     reports Unreachable/Unknown against a target you otherwise know is fine.
 
+.PARAMETER UdpRepeat
+    How many times each UDP request (DNS, NTP, CLDAP) is sent. Default 3.
+    The result reports replies as a ratio, e.g. "2/3 replies - lossy"; a
+    port counts as Responded if at least one reply came back, so loss does
+    not masquerade as a segment difference in Compare-SegmentProbes.ps1.
+
 .PARAMETER RpcSampleCount
     Set to 0 to skip the dynamic-RPC check entirely and only test the fixed
     ports. When greater than 0 (default 10) the dynamic-RPC check runs; the
@@ -93,18 +127,23 @@
 
 .NOTES
     AZITC - Alexander Zarenko IT Consulting
-    PowerShell 5.1 compatible. Read-only: TCP/UDP connect tests and a
-    registry READ only. Makes no changes anywhere.
+    PowerShell 5.1 compatible. Read-only: TCP connects, three minimal UDP
+    requests (DNS/NTP/CLDAP), a DCOM connect and a registry READ. Makes no
+    changes anywhere. Needs only .NET Framework (System.DirectoryServices.
+    Protocols for CLDAP) - no AD module, no domain membership.
 #>
 [CmdletBinding()]
 param(
     [string[]] $Target,
     [string]   $SegmentName,
     [int]      $ProbeMs         = 2000,
+    [int]      $UdpRepeat       = 3,
     [int]      $RpcSampleCount  = 10,
     [switch]   $Json,
     [string]   $OutFile
 )
+
+Add-Type -AssemblyName System.DirectoryServices.Protocols
 
 # ---------------------------------------------------------------------
 # Targets
@@ -133,22 +172,24 @@ if (-not $SegmentName) {
 # ---------------------------------------------------------------------
 # Fixed AD ports tested on every target
 # ---------------------------------------------------------------------
+# Probe = how the port is tested: Tcp (connect), Dns/Ntp/Cldap (a valid
+# minimal request for that protocol over UDP), None (listed, not probed).
 $FixedPorts = @(
-    [pscustomobject]@{ Name = 'DNS';                 Port = 53;   Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'DNS';                 Port = 53;   Proto = 'UDP' }
-    [pscustomobject]@{ Name = 'Kerberos';             Port = 88;   Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'Kerberos';             Port = 88;   Proto = 'UDP' }
-    [pscustomobject]@{ Name = 'RPC Endpoint Mapper';  Port = 135;  Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'NTP';                  Port = 123;  Proto = 'UDP' }
-    [pscustomobject]@{ Name = 'LDAP';                 Port = 389;  Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'LDAP (CLDAP)';         Port = 389;  Proto = 'UDP' }
-    [pscustomobject]@{ Name = 'SMB';                  Port = 445;  Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'Kerberos kpasswd';     Port = 464;  Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'Kerberos kpasswd';     Port = 464;  Proto = 'UDP' }
-    [pscustomobject]@{ Name = 'LDAPS';                Port = 636;  Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'Global Catalog LDAP';  Port = 3268; Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'Global Catalog LDAPS'; Port = 3269; Proto = 'TCP' }
-    [pscustomobject]@{ Name = 'AD Web Services';      Port = 9389; Proto = 'TCP' }
+    [pscustomobject]@{ Name = 'DNS';                 Port = 53;   Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'DNS';                 Port = 53;   Proto = 'UDP'; Probe = 'Dns'   }
+    [pscustomobject]@{ Name = 'Kerberos';             Port = 88;   Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'Kerberos';             Port = 88;   Proto = 'UDP'; Probe = 'None'  }
+    [pscustomobject]@{ Name = 'RPC Endpoint Mapper';  Port = 135;  Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'NTP';                  Port = 123;  Proto = 'UDP'; Probe = 'Ntp'   }
+    [pscustomobject]@{ Name = 'LDAP';                 Port = 389;  Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'LDAP (CLDAP)';         Port = 389;  Proto = 'UDP'; Probe = 'Cldap' }
+    [pscustomobject]@{ Name = 'SMB';                  Port = 445;  Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'Kerberos kpasswd';     Port = 464;  Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'Kerberos kpasswd';     Port = 464;  Proto = 'UDP'; Probe = 'None'  }
+    [pscustomobject]@{ Name = 'LDAPS';                Port = 636;  Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'Global Catalog LDAP';  Port = 3268; Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'Global Catalog LDAPS'; Port = 3269; Proto = 'TCP'; Probe = 'Tcp'   }
+    [pscustomobject]@{ Name = 'AD Web Services';      Port = 9389; Proto = 'TCP'; Probe = 'Tcp'   }
 )
 
 # ---------------------------------------------------------------------
@@ -174,30 +215,183 @@ function Test-TcpPort {
     finally { $client.Close() }
 }
 
-function Test-UdpPort {
-    param([string]$ComputerName, [int]$Port, [int]$TimeoutMs)
+# ---------------------------------------------------------------------
+# UDP probes. Each sends a VALID minimal request for its protocol (see the
+# help text for why a dummy payload tells you nothing) and is repeated
+# -UdpRepeat times. Every exchange function returns the same shape:
+#   Outcome = Response | Unexpected | Icmp | Timeout | Error
+#   Ms      = round-trip ms for a Response, else $null
+#   Error   = message for Error, else ''
+# "Unexpected" = something replied but it did not parse as that protocol -
+# still proof the port is reachable, flagged in the detail text.
+# ---------------------------------------------------------------------
+function Get-SocketErrorCode {
+    param($ErrorRecord)
+    $ex = $ErrorRecord.Exception
+    while ($ex -and -not ($ex -is [System.Net.Sockets.SocketException]) -and $ex.InnerException) { $ex = $ex.InnerException }
+    if ($ex -is [System.Net.Sockets.SocketException]) { return $ex.SocketErrorCode }
+    return $null
+}
+
+function Invoke-UdpExchange {
+    param([string]$ComputerName, [int]$Port, [byte[]]$Request, [int]$TimeoutMs)
     $client = New-Object System.Net.Sockets.UdpClient
     try {
         $client.Client.ReceiveTimeout = $TimeoutMs
         $client.Connect($ComputerName, $Port)
-        $payload = [byte[]]@(1)
-        [void]$client.Send($payload, $payload.Length)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        [void]$client.Send($Request, $Request.Length)
         try {
             $remoteEp = $null
-            [void]$client.Receive([ref]$remoteEp)
-            return 'Responded'
+            $data = $client.Receive([ref]$remoteEp)
+            $sw.Stop()
+            return [pscustomobject]@{ Outcome = 'Response'; Data = $data; Ms = [int]$sw.ElapsedMilliseconds; Error = '' }
         }
-        catch [System.Net.Sockets.SocketException] {
-            if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionReset) {
-                return 'Closed (ICMP unreachable)'
+        catch {
+            $code = Get-SocketErrorCode $_
+            if ($code -eq [System.Net.Sockets.SocketError]::ConnectionReset) {
+                return [pscustomobject]@{ Outcome = 'Icmp'; Data = $null; Ms = $null; Error = '' }
             }
-            return 'No response (UDP, inconclusive)'
+            if ($code -eq [System.Net.Sockets.SocketError]::TimedOut) {
+                return [pscustomobject]@{ Outcome = 'Timeout'; Data = $null; Ms = $null; Error = '' }
+            }
+            return [pscustomobject]@{ Outcome = 'Error'; Data = $null; Ms = $null; Error = $_.Exception.Message }
         }
     }
     catch {
-        return 'No response (UDP, inconclusive)'
+        return [pscustomobject]@{ Outcome = 'Error'; Data = $null; Ms = $null; Error = $_.Exception.Message }
     }
     finally { $client.Close() }
+}
+
+# DNS: standard query for the root NS record with RD=0, so the server
+# answers from its own data immediately instead of recursing to forwarders
+# (that would take seconds and measure the upstream, not this DC). Any
+# syntactically valid query gets a reply from a working server, whatever
+# the RCODE. A reply is accepted when the transaction ID matches and the QR
+# bit is set.
+function Invoke-DnsExchange {
+    param([string]$ComputerName, [int]$Port, [int]$TimeoutMs)
+    $id = Get-Random -Minimum 1 -Maximum 65535
+    $b = New-Object System.Collections.Generic.List[byte]
+    $b.Add([byte](($id -shr 8) -band 0xFF)); $b.Add([byte]($id -band 0xFF))
+    $b.Add(0); $b.Add(0)      # flags: standard query, RD = 0
+    $b.Add(0); $b.Add(1)      # QDCOUNT 1
+    $b.Add(0); $b.Add(0)      # ANCOUNT
+    $b.Add(0); $b.Add(0)      # NSCOUNT
+    $b.Add(0); $b.Add(0)      # ARCOUNT
+    $b.Add(0)                 # QNAME: root
+    $b.Add(0); $b.Add(2)      # QTYPE NS
+    $b.Add(0); $b.Add(1)      # QCLASS IN
+    $req = $b.ToArray()
+    $x = Invoke-UdpExchange -ComputerName $ComputerName -Port $Port -Request $req -TimeoutMs $TimeoutMs
+    if ($x.Outcome -eq 'Response') {
+        $d = $x.Data
+        $valid = ($d.Length -ge 12 -and $d[0] -eq $req[0] -and $d[1] -eq $req[1] -and (($d[2] -band 0x80) -ne 0))
+        if (-not $valid) { $x.Outcome = 'Unexpected' }
+    }
+    return $x
+}
+
+# NTP: a plain client request (LI 0, version 4, mode 3) - the fixed 48-byte
+# packet every NTP server answers, w32time included. A reply is accepted
+# when it is at least 48 bytes with a server-side mode (2, 4 or 5).
+function Invoke-NtpExchange {
+    param([string]$ComputerName, [int]$Port, [int]$TimeoutMs)
+    $req = New-Object byte[] 48
+    $req[0] = 0x23
+    $x = Invoke-UdpExchange -ComputerName $ComputerName -Port $Port -Request $req -TimeoutMs $TimeoutMs
+    if ($x.Outcome -eq 'Response') {
+        $d = $x.Data
+        $mode = 0
+        if ($d.Length -ge 1) { $mode = $d[0] -band 0x07 }
+        $valid = ($d.Length -ge 48 -and ($mode -eq 2 -or $mode -eq 4 -or $mode -eq 5))
+        if (-not $valid) { $x.Outcome = 'Unexpected' }
+    }
+    return $x
+}
+
+# CLDAP: a real connectionless LDAP RootDSE search - the same mechanism the
+# DC locator ping uses - via System.DirectoryServices.Protocols with the
+# identifier's connectionless flag set. A DirectoryOperationException means
+# the server answered (with an LDAP error) and still counts as reachable;
+# an LdapException 85 (LDAP_TIMEOUT) or 81 (LDAP_SERVER_DOWN) is "no reply".
+function Invoke-CldapExchange {
+    param([string]$ComputerName, [int]$Port, [int]$TimeoutMs)
+    $conn = $null
+    try {
+        $id   = New-Object System.DirectoryServices.Protocols.LdapDirectoryIdentifier -ArgumentList $ComputerName, $Port, $false, $true
+        $conn = New-Object System.DirectoryServices.Protocols.LdapConnection -ArgumentList $id
+        $conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
+        $conn.SessionOptions.ProtocolVersion = 3
+        $conn.Timeout = [TimeSpan]::FromMilliseconds($TimeoutMs)
+        $req = New-Object System.DirectoryServices.Protocols.SearchRequest
+        $req.DistinguishedName = ''
+        $req.Filter = '(objectClass=*)'
+        $req.Scope = [System.DirectoryServices.Protocols.SearchScope]::Base
+        [void]$req.Attributes.Add('dnsHostName')
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $null = $conn.SendRequest($req)
+        $sw.Stop()
+        return [pscustomobject]@{ Outcome = 'Response'; Data = $null; Ms = [int]$sw.ElapsedMilliseconds; Error = '' }
+    }
+    catch {
+        $ex = $_.Exception
+        while ($ex -and -not ($ex -is [System.DirectoryServices.Protocols.LdapException]) -and -not ($ex -is [System.DirectoryServices.Protocols.DirectoryOperationException]) -and $ex.InnerException) { $ex = $ex.InnerException }
+        if ($ex -is [System.DirectoryServices.Protocols.DirectoryOperationException]) {
+            return [pscustomobject]@{ Outcome = 'Response'; Data = $null; Ms = $null; Error = '' }
+        }
+        if ($ex -is [System.DirectoryServices.Protocols.LdapException]) {
+            if ($ex.ErrorCode -eq 85 -or $ex.ErrorCode -eq 81) {
+                return [pscustomobject]@{ Outcome = 'Timeout'; Data = $null; Ms = $null; Error = ('LDAP error {0}' -f $ex.ErrorCode) }
+            }
+            return [pscustomobject]@{ Outcome = 'Error'; Data = $null; Ms = $null; Error = ('LDAP error {0}: {1}' -f $ex.ErrorCode, $ex.Message) }
+        }
+        return [pscustomobject]@{ Outcome = 'Error'; Data = $null; Ms = $null; Error = $_.Exception.Message }
+    }
+    finally { if ($conn) { $conn.Dispose() } }
+}
+
+# Runs one of the exchange functions -Repeat times and condenses the
+# outcomes into State (what Compare-SegmentProbes.ps1 diffs on), Detail (the
+# ratio and anything odd) and Ms (best round trip). Responded needs just one
+# reply, so loss shows up in the detail text, not as a segment difference.
+function Measure-UdpProbe {
+    param([string]$Exchange, [string]$ComputerName, [int]$Port, [int]$TimeoutMs, [int]$Repeat)
+    $ok = 0; $odd = 0; $icmp = 0; $timeouts = 0; $errors = 0
+    $bestMs = $null; $lastError = ''
+    for ($n = 1; $n -le $Repeat; $n++) {
+        $x = & $Exchange -ComputerName $ComputerName -Port $Port -TimeoutMs $TimeoutMs
+        if ($x.Outcome -eq 'Response' -or $x.Outcome -eq 'Unexpected') {
+            if ($x.Outcome -eq 'Unexpected') { $odd++ } else { $ok++ }
+            if ($null -ne $x.Ms -and ($null -eq $bestMs -or $x.Ms -lt $bestMs)) { $bestMs = $x.Ms }
+        }
+        elseif ($x.Outcome -eq 'Icmp')    { $icmp++ }
+        elseif ($x.Outcome -eq 'Timeout') { $timeouts++; if ($x.Error) { $lastError = $x.Error } }
+        else                              { $errors++; $lastError = $x.Error }
+    }
+    $replies = $ok + $odd
+    $ratio   = '{0}/{1} replies' -f $replies, $Repeat
+    if ($replies -gt 0) {
+        $state  = 'Responded'
+        $detail = $ratio
+        if ($replies -lt $Repeat) { $detail += ' - lossy' }
+        if ($odd -gt 0) { $detail += (' - {0} did not parse as the expected protocol' -f $odd) }
+    }
+    elseif ($icmp -gt 0) {
+        $state  = 'Closed (ICMP unreachable)'
+        $detail = ('{0}, {1} ICMP port-unreachable' -f $ratio, $icmp)
+    }
+    elseif ($errors -eq $Repeat) {
+        $state  = 'Error'
+        $detail = $lastError
+    }
+    else {
+        $state  = 'No response'
+        $detail = $ratio + ' - no listener, firewall, or loss: NOT a firewall verdict on its own, check the listener inventory'
+        if ($lastError) { $detail += (' ({0})' -f $lastError) }
+    }
+    return [pscustomobject]@{ State = $state; Detail = $detail; Ms = $bestMs }
 }
 
 # ---------------------------------------------------------------------
@@ -323,7 +517,7 @@ function Test-RpcDynamic {
 # ---------------------------------------------------------------------
 Write-Host ''
 Write-Host ('Segment: {0}' -f $SegmentName) -ForegroundColor Cyan
-Write-Host ('Testing {0} target(s), {1} fixed ports each, {2} ms timeout.' -f $Target.Count, $FixedPorts.Count, $ProbeMs) -ForegroundColor Cyan
+Write-Host ('Testing {0} target(s), {1} fixed ports each, {2} ms timeout, UDP requests sent {3}x.' -f $Target.Count, $FixedPorts.Count, $ProbeMs, $UdpRepeat) -ForegroundColor Cyan
 Write-Host ''
 
 $results = New-Object System.Collections.ArrayList
@@ -338,14 +532,21 @@ foreach ($t in $Target) {
 
     $portResults = New-Object System.Collections.ArrayList
     foreach ($p in $FixedPorts) {
-        if ($p.Proto -eq 'TCP') {
+        $state = ''; $detail = ''; $ms = $null
+        if ($p.Probe -eq 'Tcp') {
             $r = Test-TcpPort -ComputerName $t -Port $p.Port -TimeoutMs $ProbeMs
-            [void]$portResults.Add([pscustomobject]@{ Name = $p.Name; Port = $p.Port; Proto = $p.Proto; State = $r.State; Ms = $r.Ms })
+            $state = $r.State; $ms = $r.Ms
+        }
+        elseif ($p.Probe -eq 'None') {
+            $state  = 'Not probed'
+            $detail = 'no cheap valid UDP request exists for this protocol; Windows clients use TCP here - see the TCP row'
         }
         else {
-            $state = Test-UdpPort -ComputerName $t -Port $p.Port -TimeoutMs $ProbeMs
-            [void]$portResults.Add([pscustomobject]@{ Name = $p.Name; Port = $p.Port; Proto = $p.Proto; State = $state; Ms = $null })
+            $exchange = 'Invoke-{0}Exchange' -f $p.Probe
+            $r = Measure-UdpProbe -Exchange $exchange -ComputerName $t -Port $p.Port -TimeoutMs $ProbeMs -Repeat $UdpRepeat
+            $state = $r.State; $detail = $r.Detail; $ms = $r.Ms
         }
+        [void]$portResults.Add([pscustomobject]@{ Name = $p.Name; Port = $p.Port; Proto = $p.Proto; State = $state; Detail = $detail; Ms = $ms })
     }
 
     $rpcPortsTested = New-Object System.Collections.ArrayList
@@ -440,16 +641,20 @@ if ($Json) {
 # ---------------------------------------------------------------------
 foreach ($res in $results) {
     Write-Host ('Target: {0}' -f $res.Target) -ForegroundColor Cyan
-    $fmt = '  {0,-24} {1,6} {2,-5} {3,-30} {4,8}'
-    Write-Host ($fmt -f 'Service', 'Port', 'Proto', 'State', 'ms') -ForegroundColor DarkGray
+    $fmt = '  {0,-22} {1,5} {2,-4} {3,-26} {4,6}  {5}'
+    Write-Host ($fmt -f 'Service', 'Port', 'Prot', 'State', 'ms', 'Detail') -ForegroundColor DarkGray
 
     foreach ($p in $res.Ports) {
         $colour = 'Yellow'
-        if ($p.State -eq 'Open' -or $p.State -eq 'Responded') { $colour = 'Green' }
-        elseif ($p.State -like 'Closed*' -or $p.State -like 'Filtered*') { $colour = 'Red' }
+        if ($p.State -eq 'Open') { $colour = 'Green' }
+        elseif ($p.State -eq 'Responded') { $colour = if ($p.Detail -like '*lossy*') { 'Yellow' } else { 'Green' } }
+        elseif ($p.State -eq 'Not probed') { $colour = 'DarkGray' }
+        elseif ($p.State -like 'Closed*' -or $p.State -like 'Filtered*' -or $p.State -eq 'Error') { $colour = 'Red' }
         $msTxt = '-'
         if ($null -ne $p.Ms) { $msTxt = $p.Ms }
-        Write-Host ($fmt -f $p.Name, $p.Port, $p.Proto, $p.State, $msTxt) -ForegroundColor $colour
+        $detailTxt = ''
+        if ($p.Detail) { $detailTxt = $p.Detail }
+        Write-Host ($fmt -f $p.Name, $p.Port, $p.Proto, $p.State, $msTxt, $detailTxt) -ForegroundColor $colour
     }
 
     Write-Host ('  RPC dynamic: {0}' -f $res.RpcNote) -ForegroundColor DarkGray
