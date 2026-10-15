@@ -35,9 +35,13 @@
     and reads "Filtered" on a perfectly healthy DC, which cannot be told apart
     from a genuinely blocked range. Instead the script exercises the real path -
     EPM (135) handing out a dynamically-assigned port - with a bounded DCOM/RPC
-    call and reports whether that path is Reachable, Reachable (access denied -
-    connectivity is fine, only WMI rights are missing), or Unreachable (RPC
-    server unavailable / timeout = EPM or the dynamic port is blocked).
+    call (its timeout follows -ProbeMs) and reports whether that path is
+    Reachable, Reachable (access denied - connectivity is fine, only WMI
+    rights are missing), Unreachable (RPC server unavailable / timeout = EPM
+    or the dynamic port is blocked), or Unknown (the call failed with
+    something other than those two recognized errors - e.g. a name
+    resolution failure - and is deliberately NOT counted as reachable; check
+    it manually rather than trust an unclassified error either way).
 
     Tag each run with -SegmentName and save it with -OutFile, then run the
     SAME command from a different segment against the SAME targets. Feed
@@ -58,7 +62,12 @@
     output so Compare-SegmentProbes.ps1 can tell runs apart.
 
 .PARAMETER ProbeMs
-    Timeout in milliseconds for each individual TCP/UDP probe. Default 2000.
+    Timeout in milliseconds for each individual TCP/UDP probe, and also for
+    the DCOM/RPC reachability call used for the unrestricted dynamic-RPC
+    check (see RpcSampleCount). Default 2000. A WMI/DCOM connect typically
+    needs more headroom than a bare TCP connect, especially over a
+    higher-latency WAN link between segments - raise this if that check
+    reports Unreachable/Unknown against a target you otherwise know is fine.
 
 .PARAMETER RpcSampleCount
     Set to 0 to skip the dynamic-RPC check entirely and only test the fixed
@@ -230,15 +239,21 @@ function Get-RpcPortConfig {
 
 # ---------------------------------------------------------------------
 # Real dynamic-RPC reachability: a DCOM/RPC call (EPM 135 -> a dynamic port),
-# bounded by a timeout. Connectivity is the signal, not WMI permissions:
+# bounded by -ProbeMs. Connectivity is the signal, not WMI permissions:
 #   Reachable                     - the call returned data
 #   Reachable (access denied)     - reached the service, just no WMI rights
 #   Unreachable (RPC unavailable) - EPM/dynamic port blocked (0x800706BA)
 #   Unreachable (timeout)         - no response within the timeout
+#   Unknown                       - failed with something else entirely
+#                                    (e.g. name resolution) - NOT treated as
+#                                    reachable; a false "Reachable" here would
+#                                    be the one false-clear this script must
+#                                    not produce, so an unrecognized error
+#                                    stays unclassified rather than optimistic.
 # HRESULT hex in the message is matched (locale-independent).
 # ---------------------------------------------------------------------
 function Test-RpcDynamic {
-    param([string]$ComputerName)
+    param([string]$ComputerName, [int]$TimeoutMs)
     # Synchronous and in-process (Start-Job fails under Constrained Language mode,
     # the norm on hardened systems). ManagementScope.Connect returns fast when
     # reachable (even access-denied comes back in ms) and returns a definitive
@@ -265,7 +280,7 @@ function Test-RpcDynamic {
     $result = $null
     try {
         $opts = New-Object System.Management.ConnectionOptions
-        $opts.Timeout = [TimeSpan]::FromSeconds(10)
+        $opts.Timeout = [TimeSpan]::FromMilliseconds($TimeoutMs)
         $scope = New-Object System.Management.ManagementScope(("\\{0}\root\cimv2" -f $ComputerName), $opts)
         $scope.Connect()
         $result = [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (DCOM/RPC connect succeeded)' }
@@ -281,7 +296,12 @@ function Test-RpcDynamic {
             $result = [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (access denied - connectivity OK, no WMI rights)' }
         }
         else {
-            $result = [pscustomobject]@{ Reach = 'Reachable'; Detail = ('Reachable (server responded: ' + $inner + ')') }
+            # Neither recognized pattern matched - could be a genuine connectivity
+            # problem (e.g. name resolution failure) that just isn't worded like
+            # "RPC server unavailable". Reporting this as Reachable would be an
+            # unverified guess in exactly the direction this script must not
+            # guess in, so it stays Unknown and surfaces the raw message instead.
+            $result = [pscustomobject]@{ Reach = 'Unknown'; Detail = ('Unknown (unclassified error - verify manually: ' + $inner + ')') }
         }
     }
 
@@ -375,7 +395,7 @@ foreach ($t in $Target) {
             }
             $epm = $portResults | Where-Object { $_.Port -eq 135 -and $_.Proto -eq 'TCP' } | Select-Object -First 1
             if ($epm -and $epm.State -eq 'Open') {
-                $probe     = Test-RpcDynamic -ComputerName $t
+                $probe     = Test-RpcDynamic -ComputerName $t -TimeoutMs $ProbeMs
                 $rpcReach  = $probe.Reach
                 $rpcDetail = $probe.Detail
             }
