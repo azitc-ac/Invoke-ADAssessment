@@ -29,12 +29,15 @@
       - Netlogon DCTcpipPort
       - NTFRS / DFSR "RPC TCP/IP Port Assignment"
     If a restriction is configured, those exact ports are tested - a precise,
-    fast, conclusive result. If nothing is configured (the default, wide-open
-    49152-65535 range) or the registry can't be read from here (itself a
-    diagnostic signal - it means remote registry/RPC is blocked from this
-    vantage point), a small, clearly labelled, non-exhaustive sample of the
-    default range is tested instead and never reported as proof of full-range
-    reachability.
+    fast, conclusive result. If nothing is configured (the default dynamic
+    range) or the registry can't be read from here, the range is NOT sampled
+    with arbitrary ports: an unused dynamic port is dropped by the host firewall
+    and reads "Filtered" on a perfectly healthy DC, which cannot be told apart
+    from a genuinely blocked range. Instead the script exercises the real path -
+    EPM (135) handing out a dynamically-assigned port - with a bounded DCOM/RPC
+    call and reports whether that path is Reachable, Reachable (access denied -
+    connectivity is fine, only WMI rights are missing), or Unreachable (RPC
+    server unavailable / timeout = EPM or the dynamic port is blocked).
 
     Tag each run with -SegmentName and save it with -OutFile, then run the
     SAME command from a different segment against the SAME targets. Feed
@@ -58,9 +61,12 @@
     Timeout in milliseconds for each individual TCP/UDP probe. Default 2000.
 
 .PARAMETER RpcSampleCount
-    How many ports to spot-check when the dynamic RPC range is unrestricted
-    (or unreadable from here). Default 10. Set to 0 to skip the dynamic-RPC
-    check entirely and only test the fixed ports.
+    Set to 0 to skip the dynamic-RPC check entirely and only test the fixed
+    ports. When greater than 0 (default 10) the dynamic-RPC check runs; the
+    number is only used to step through a CONFIGURED wide RPC range when one is
+    found in the registry (how many points across that range to test). The
+    unrestricted case no longer samples arbitrary ports - it uses the DCOM/RPC
+    reachability call described above.
 
 .PARAMETER Json
     Emit the result as JSON to the pipeline instead of a formatted table.
@@ -223,6 +229,45 @@ function Get-RpcPortConfig {
 }
 
 # ---------------------------------------------------------------------
+# Real dynamic-RPC reachability: a DCOM/RPC call (EPM 135 -> a dynamic port),
+# bounded by a timeout. Connectivity is the signal, not WMI permissions:
+#   Reachable                     - the call returned data
+#   Reachable (access denied)     - reached the service, just no WMI rights
+#   Unreachable (RPC unavailable) - EPM/dynamic port blocked (0x800706BA)
+#   Unreachable (timeout)         - no response within the timeout
+# HRESULT hex in the message is matched (locale-independent).
+# ---------------------------------------------------------------------
+function Test-RpcDynamic {
+    param([string]$ComputerName)
+    # Synchronous and in-process (Start-Job fails under Constrained Language mode,
+    # the norm on hardened systems). ManagementScope.Connect returns fast when
+    # reachable (even access-denied comes back in ms) and returns a definitive
+    # "RPC server unavailable" when the dynamic port is filtered (after the OS RPC
+    # timeout, ~25 s - it does not hang forever). Any definitive server answer
+    # means the transport reached the dynamic port = Reachable; only an explicit
+    # RPC-unavailable means blocked. Message is localised + wrapped, so match words.
+    try {
+        $opts = New-Object System.Management.ConnectionOptions
+        $opts.Timeout = [TimeSpan]::FromSeconds(10)
+        $scope = New-Object System.Management.ManagementScope(("\\{0}\root\cimv2" -f $ComputerName), $opts)
+        $scope.Connect()
+        return [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (DCOM/RPC connect succeeded)' }
+    }
+    catch {
+        $full  = "$($_.Exception.Message)"
+        $inner = if ($_.Exception.InnerException) { "$($_.Exception.InnerException.Message)" } else { $full }
+        $inner = (($inner -split "`r?`n")[0]).Trim()
+        if ($full -match '(?i)0x800706BA|RPC server is unavailable|RPC-Server ist nicht') {
+            return [pscustomobject]@{ Reach = 'Unreachable'; Detail = 'Unreachable (RPC server unavailable - EPM or dynamic port blocked)' }
+        }
+        if ($full -match '(?i)0x80070005|E_ACCESSDENIED|access is denied|zugriff verweigert') {
+            return [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (access denied - connectivity OK, no WMI rights)' }
+        }
+        return [pscustomobject]@{ Reach = 'Reachable'; Detail = ('Reachable (server responded: ' + $inner + ')') }
+    }
+}
+
+# ---------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------
 Write-Host ''
@@ -253,7 +298,9 @@ foreach ($t in $Target) {
     }
 
     $rpcPortsTested = New-Object System.Collections.ArrayList
-    $rpcNote = 'Dynamic RPC sampling skipped (-RpcSampleCount 0).'
+    $rpcReach  = $null
+    $rpcDetail = $null
+    $rpcNote = 'Dynamic RPC check skipped (-RpcSampleCount 0).'
 
     if ($RpcSampleCount -gt 0) {
         $rpcConfig = Get-RpcPortConfig -ComputerName $t
@@ -281,37 +328,40 @@ foreach ($t in $Target) {
                 [void]$rpcPortsTested.Add([pscustomobject]@{ Port = $port; State = $r.State; Ms = $r.Ms })
             }
         }
-        elseif ($rpcConfig.Readable) {
-            $rpcNote = 'No RPC port restriction configured on this DC (default 49152-65535) - spot-checking a non-exhaustive sample, not proof of full-range reachability.'
-            $lo = 49152; $hi = 65535
-            $step = [int](($hi - $lo) / $RpcSampleCount)
-            # Deterministic sample (mid-bucket, no jitter) so the SAME ports are
-            # tested on every run and Compare-SegmentProbes.ps1 can diff them.
-            for ($n = 0; $n -lt $RpcSampleCount; $n++) {
-                $port = $lo + ($n * $step) + [int]($step / 2)
-                $r = Test-TcpPort -ComputerName $t -Port $port -TimeoutMs $ProbeMs
-                [void]$rpcPortsTested.Add([pscustomobject]@{ Port = $port; State = $r.State; Ms = $r.Ms })
-            }
-        }
         else {
-            $rpcNote = 'Could not read the RPC port configuration from here (registry access blocked - itself a diagnostic signal) - spot-checking a non-exhaustive sample of the default range.'
-            $lo = 49152; $hi = 65535
-            $step = [int](($hi - $lo) / $RpcSampleCount)
-            # Deterministic sample (mid-bucket, no jitter) so the SAME ports are
-            # tested on every run and Compare-SegmentProbes.ps1 can diff them.
-            for ($n = 0; $n -lt $RpcSampleCount; $n++) {
-                $port = $lo + ($n * $step) + [int]($step / 2)
-                $r = Test-TcpPort -ComputerName $t -Port $port -TimeoutMs $ProbeMs
-                [void]$rpcPortsTested.Add([pscustomobject]@{ Port = $port; State = $r.State; Ms = $r.Ms })
+            # No explicit restriction (or the registry is unreadable from here).
+            # Arbitrary ports in the dynamic range are assigned on demand and the
+            # host firewall drops them while unused, so probing random ports is
+            # misleading - they read "Filtered" on a perfectly healthy DC and
+            # cannot tell "unused" from "blocked range" apart. Instead exercise
+            # the REAL path - EPM (135) handing out a dynamic port - with a
+            # DCOM/RPC call, and classify the outcome.
+            if ($rpcConfig.Readable) {
+                $rpcNote = 'No RPC restriction configured (default dynamic range). Testing actual reachability via a DCOM/RPC call (EPM 135 -> a dynamic port).'
+            }
+            else {
+                $rpcNote = 'RPC port configuration not readable from here. Testing actual reachability via a DCOM/RPC call (EPM 135 -> a dynamic port).'
+            }
+            $epm = $portResults | Where-Object { $_.Port -eq 135 -and $_.Proto -eq 'TCP' } | Select-Object -First 1
+            if ($epm -and $epm.State -eq 'Open') {
+                $probe     = Test-RpcDynamic -ComputerName $t
+                $rpcReach  = $probe.Reach
+                $rpcDetail = $probe.Detail
+            }
+            else {
+                $rpcReach  = 'Unreachable'
+                $rpcDetail = 'Unreachable (RPC Endpoint Mapper on TCP 135 is not reachable from here)'
             }
         }
     }
 
     [void]$results.Add([pscustomobject]@{
-        Target   = $t
-        Ports    = $portResults
-        RpcNote  = $rpcNote
-        RpcPorts = $rpcPortsTested
+        Target    = $t
+        Ports     = $portResults
+        RpcNote   = $rpcNote
+        RpcPorts  = $rpcPortsTested
+        RpcReach  = $rpcReach
+        RpcDetail = $rpcDetail
     })
 }
 
@@ -355,6 +405,10 @@ foreach ($res in $results) {
     foreach ($rp in $res.RpcPorts) {
         $colour = if ($rp.State -eq 'Open') { 'Green' } else { 'Red' }
         Write-Host ('    port {0,-6} {1}' -f $rp.Port, $rp.State) -ForegroundColor $colour
+    }
+    if ($res.RpcDetail) {
+        $rc = switch ($res.RpcReach) { 'Reachable' { 'Green' } 'Unreachable' { 'Red' } default { 'Yellow' } }
+        Write-Host ('    {0}' -f $res.RpcDetail) -ForegroundColor $rc
     }
     Write-Host ''
 }

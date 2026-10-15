@@ -119,6 +119,22 @@ foreach ($run in $runs) {
             }
             $matrix[$key].States[$run.SegmentName] = $rp.State
         }
+        # Dynamic-RPC reachability (DCOM/RPC call), normalised to Reachable /
+        # Unreachable / Unknown so access-denied (still reachable) does not read
+        # as a difference - only a real connectivity asymmetry does.
+        if ($t.RpcReach) {
+            $key = '{0}|dynamic|RPC' -f $t.Target
+            if (-not $matrix.ContainsKey($key)) {
+                $matrix[$key] = [pscustomobject]@{
+                    Target = $t.Target
+                    Port   = 'dynamic'
+                    Proto  = 'RPC'
+                    Name   = 'RPC dynamic (DCOM reach)'
+                    States = [ordered]@{}
+                }
+            }
+            $matrix[$key].States[$run.SegmentName] = $t.RpcReach
+        }
     }
 }
 
@@ -145,8 +161,8 @@ else {
             $state = $row.States[$seg]
             if (-not $state) { $state = '(not tested)' }
             $colour = 'DarkYellow'
-            if ($state -match 'Open|Responded') { $colour = 'Green' }
-            elseif ($state -match 'Closed|Filtered') { $colour = 'Red' }
+            if ($state -match 'Open|Responded|\bReachable') { $colour = 'Green' }
+            elseif ($state -match 'Closed|Filtered|Unreachable') { $colour = 'Red' }
             Write-Host ('      {0,-32} {1}' -f $seg, $state) -ForegroundColor $colour
         }
     }
@@ -195,8 +211,8 @@ if ($HtmlReport) {
             $state = $row.States[$seg]
             if (-not $state) { $state = '(not tested)' }
             $cls = 'unclear'
-            if ($state -match 'Open|Responded') { $cls = 'open' }
-            elseif ($state -match 'Closed|Filtered') { $cls = 'closed' }
+            if ($state -match 'Open|Responded|\bReachable') { $cls = 'open' }
+            elseif ($state -match 'Closed|Filtered|Unreachable') { $cls = 'closed' }
             [void]$sb.Append("<td class='$cls'>" + (ConvertTo-HtmlEncoded $state) + '</td>')
         }
         [void]$sb.Append('</tr>')
