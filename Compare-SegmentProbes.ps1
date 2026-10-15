@@ -104,6 +104,21 @@ foreach ($run in $runs) {
             }
             $matrix[$key].States[$run.SegmentName] = $p.State
         }
+        # Dynamic RPC ports (TCP). Deterministic per run, so they diff too - the
+        # classic "segments connected but the RPC range is blocked" case.
+        foreach ($rp in $t.RpcPorts) {
+            $key = '{0}|{1}|{2}' -f $t.Target, $rp.Port, 'TCP'
+            if (-not $matrix.ContainsKey($key)) {
+                $matrix[$key] = [pscustomobject]@{
+                    Target = $t.Target
+                    Port   = $rp.Port
+                    Proto  = 'TCP'
+                    Name   = 'RPC dynamic'
+                    States = [ordered]@{}
+                }
+            }
+            $matrix[$key].States[$run.SegmentName] = $rp.State
+        }
     }
 }
 

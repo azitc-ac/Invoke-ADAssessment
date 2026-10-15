@@ -285,9 +285,10 @@ foreach ($t in $Target) {
             $rpcNote = 'No RPC port restriction configured on this DC (default 49152-65535) - spot-checking a non-exhaustive sample, not proof of full-range reachability.'
             $lo = 49152; $hi = 65535
             $step = [int](($hi - $lo) / $RpcSampleCount)
+            # Deterministic sample (mid-bucket, no jitter) so the SAME ports are
+            # tested on every run and Compare-SegmentProbes.ps1 can diff them.
             for ($n = 0; $n -lt $RpcSampleCount; $n++) {
-                $jitter = Get-Random -Minimum 0 -Maximum ([Math]::Max(1, $step))
-                $port = $lo + ($n * $step) + $jitter
+                $port = $lo + ($n * $step) + [int]($step / 2)
                 $r = Test-TcpPort -ComputerName $t -Port $port -TimeoutMs $ProbeMs
                 [void]$rpcPortsTested.Add([pscustomobject]@{ Port = $port; State = $r.State; Ms = $r.Ms })
             }
@@ -296,9 +297,10 @@ foreach ($t in $Target) {
             $rpcNote = 'Could not read the RPC port configuration from here (registry access blocked - itself a diagnostic signal) - spot-checking a non-exhaustive sample of the default range.'
             $lo = 49152; $hi = 65535
             $step = [int](($hi - $lo) / $RpcSampleCount)
+            # Deterministic sample (mid-bucket, no jitter) so the SAME ports are
+            # tested on every run and Compare-SegmentProbes.ps1 can diff them.
             for ($n = 0; $n -lt $RpcSampleCount; $n++) {
-                $jitter = Get-Random -Minimum 0 -Maximum ([Math]::Max(1, $step))
-                $port = $lo + ($n * $step) + $jitter
+                $port = $lo + ($n * $step) + [int]($step / 2)
                 $r = Test-TcpPort -ComputerName $t -Port $port -TimeoutMs $ProbeMs
                 [void]$rpcPortsTested.Add([pscustomobject]@{ Port = $port; State = $r.State; Ms = $r.Ms })
             }
