@@ -246,25 +246,56 @@ function Test-RpcDynamic {
     # timeout, ~25 s - it does not hang forever). Any definitive server answer
     # means the transport reached the dynamic port = Reachable; only an explicit
     # RPC-unavailable means blocked. Message is localised + wrapped, so match words.
+
+    # Resolve the target's IPv4 addresses so we can spot the dynamic high port the
+    # DCOM/RPC connection actually lands on (a new established TCP conn to the DC).
+    $ips = @()
+    try { $ips = @([Net.Dns]::GetHostAddresses($ComputerName) | Where-Object { $_.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.IPAddressToString }) } catch { }
+    $snapshot = {
+        $h = @{}
+        try {
+            Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+                Where-Object { $_.RemotePort -ge 49152 -and ($ips -contains $_.RemoteAddress) } |
+                ForEach-Object { $h[[string]$_.LocalPort] = [int]$_.RemotePort }
+        } catch { }
+        $h
+    }
+    $before = & $snapshot
+
+    $result = $null
     try {
         $opts = New-Object System.Management.ConnectionOptions
         $opts.Timeout = [TimeSpan]::FromSeconds(10)
         $scope = New-Object System.Management.ManagementScope(("\\{0}\root\cimv2" -f $ComputerName), $opts)
         $scope.Connect()
-        return [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (DCOM/RPC connect succeeded)' }
+        $result = [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (DCOM/RPC connect succeeded)' }
     }
     catch {
         $full  = "$($_.Exception.Message)"
         $inner = if ($_.Exception.InnerException) { "$($_.Exception.InnerException.Message)" } else { $full }
         $inner = (($inner -split "`r?`n")[0]).Trim()
         if ($full -match '(?i)0x800706BA|RPC server is unavailable|RPC-Server ist nicht') {
-            return [pscustomobject]@{ Reach = 'Unreachable'; Detail = 'Unreachable (RPC server unavailable - EPM or dynamic port blocked)' }
+            $result = [pscustomobject]@{ Reach = 'Unreachable'; Detail = 'Unreachable (RPC server unavailable - EPM or dynamic port blocked)' }
         }
-        if ($full -match '(?i)0x80070005|E_ACCESSDENIED|access is denied|zugriff verweigert') {
-            return [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (access denied - connectivity OK, no WMI rights)' }
+        elseif ($full -match '(?i)0x80070005|E_ACCESSDENIED|access is denied|zugriff verweigert') {
+            $result = [pscustomobject]@{ Reach = 'Reachable'; Detail = 'Reachable (access denied - connectivity OK, no WMI rights)' }
         }
-        return [pscustomobject]@{ Reach = 'Reachable'; Detail = ('Reachable (server responded: ' + $inner + ')') }
+        else {
+            $result = [pscustomobject]@{ Reach = 'Reachable'; Detail = ('Reachable (server responded: ' + $inner + ')') }
+        }
     }
+
+    # Name the dynamic high port this connection actually used (ephemeral - it
+    # varies per binding, so it illustrates that the range is in use; it is NOT a
+    # single port to whitelist, and does not feed the segment diff).
+    if ($result.Reach -eq 'Reachable') {
+        $after    = & $snapshot
+        $newLocal = @($after.Keys | Where-Object { -not $before.ContainsKey($_) })
+        if ($newLocal.Count -gt 0) {
+            $result.Detail = $result.Detail + ('  [dynamic port used this run: {0}]' -f $after[$newLocal[0]])
+        }
+    }
+    return $result
 }
 
 # ---------------------------------------------------------------------
