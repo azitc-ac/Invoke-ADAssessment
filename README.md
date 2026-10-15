@@ -72,6 +72,14 @@ Alongside the main assessment, the repo carries focused scripts for two problems
 - `Get-DcMemoryPressure.ps1` — the counters that actually indicate memory pressure (Available MBytes, commit charge, Pages/sec, LSASS trend), because "free RAM" is meaningless when LSASS caches the database.
 - `Get-DnsStaleRecords.ps1` — lists DNS records by timestamp age to show what scavenging would delete *before* you enable it, surfacing the risk group: live hosts with a stale timestamp that nothing refreshes.
 
+**Network segmentation evidence**
+
+For "the network is probably misconfigured" claims specifically — proving or disproving that segments aren't properly connected needs comparison across vantage points, not just one more single-host test.
+
+- `Test-AdPortMatrix.ps1` — reachability matrix for the fixed AD ports (DNS, Kerberos, RPC endpoint mapper, LDAP/LDAPS, SMB, kpasswd, Global Catalog, NTP, AD Web Services) against one or more targets. Pure TCP/UDP connect tests — no AD credentials or domain membership needed, so it runs from a jump box in any segment. Also best-effort checks the dynamic RPC port(s) used by replication: reads each DC's actual configured RPC port restriction via remote registry if one exists and tests exactly those ports, or spot-checks a clearly labelled, non-exhaustive sample of the default 49152–65535 range otherwise. Tag a run with `-SegmentName` and save it with `-OutFile` for comparison.
+- `Test-AdSiteSubnetCoverage.ps1` — read-only AD Sites & Services audit: subnets with no site, sites with no subnet or no site link, site links left at the untouched defaults, and (`-CheckDns`) DNS A records whose IP falls outside every registered subnet. A client AD can't map to a subnet gets no site assignment and doesn't reliably pick the local DC — one of the most common AD-side causes behind a "the network must be misconfigured" complaint, fully visible from AD itself without touching any other segment.
+- `Compare-SegmentProbes.ps1` — the actual proof step: diffs two or more `Test-AdPortMatrix.ps1` JSON results and reports every target/port combination that behaves differently depending on which segment the probe ran from. That asymmetry, not any single run, is the evidence a segmentation claim needs. `-HtmlReport` writes a self-contained, colour-coded report to hand the customer directly.
+
 > These touch certificates, Kerberos and SMB on live DCs. Reading them can look like attacker enumeration to a SIEM — give the SOC/EDR team a heads-up, as with the main assessment.
 
 ## License
